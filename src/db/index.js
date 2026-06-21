@@ -40,10 +40,21 @@ import pg from 'pg';
         country TEXT,
         region TEXT,
         city TEXT,
+        access_token TEXT,
+        refresh_token TEXT,
+        token_expires_at TIMESTAMPTZ,
         verified_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(user_id, guild_id)
       )
     `);
+
+    -- 기존 테이블에 컬럼이 없으면 추가
+    await query(`
+      ALTER TABLE verified_users
+        ADD COLUMN IF NOT EXISTS access_token TEXT,
+        ADD COLUMN IF NOT EXISTS refresh_token TEXT,
+        ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ
+    `).catch(() => {});
 
     await query(`
       CREATE TABLE IF NOT EXISTS recovery_keys (

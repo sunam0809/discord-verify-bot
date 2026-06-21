@@ -4,7 +4,8 @@ import { Client, GatewayIntentBits, REST, Routes } from 'discord.js';
   import { 복구키사용Command, 복구키사용Execute } from './commands/복구키사용.js';
   import { handleButtonInteraction } from './interactions.js';
 
-  const ALLOWED_ROLE_ID = '1368030640628301865';
+  // 허용된 유저 ID (이 유저만 명령어 사용 가능)
+  const ALLOWED_USER_ID = '1368030640628301865';
   const BOT_TOKEN = process.env.BOT_TOKEN;
   const CLIENT_ID = process.env.CLIENT_ID;
 
@@ -24,22 +25,6 @@ import { Client, GatewayIntentBits, REST, Routes } from 'discord.js';
     console.log('[Bot] Slash commands registered globally');
   }
 
-  // Discord.js 슬래시 커맨드 인터랙션에서 member.roles 는
-  // 캐시된 GuildMember면 Collection, 아니면 role ID 문자열 배열로 옴
-  function hasAllowedRole(member) {
-    if (!member) return false;
-    const roles = member.roles;
-    // API interaction member: roles is a string[]
-    if (Array.isArray(roles)) {
-      return roles.includes(ALLOWED_ROLE_ID);
-    }
-    // Cached GuildMember: roles is GuildMemberRoleManager
-    if (roles && typeof roles.cache !== 'undefined') {
-      return roles.cache.has(ALLOWED_ROLE_ID);
-    }
-    return false;
-  }
-
   client.once('ready', () => {
     console.log(`[Bot] Logged in as ${client.user.tag}`);
   });
@@ -52,7 +37,8 @@ import { Client, GatewayIntentBits, REST, Routes } from 'discord.js';
 
     if (!interaction.isChatInputCommand()) return;
 
-    if (!hasAllowedRole(interaction.member)) {
+    // 유저 ID 체크
+    if (interaction.user.id !== ALLOWED_USER_ID) {
       return interaction.reply({ content: '❌ 이 명령어를 사용할 권한이 없습니다.', ephemeral: true });
     }
 

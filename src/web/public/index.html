@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+  <html lang="ko">
+  <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Discord 인증 봇</title>
+  <style>
+    * { margin:0;padding:0;box-sizing:border-box; }
+    body { font-family:'gg sans','Noto Sans KR',-apple-system,sans-serif; background:#1e1f22; color:#f2f3f5; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+    .container { background:#2b2d31; border-radius:16px; padding:48px 40px; max-width:460px; width:100%; box-shadow:0 8px 32px rgba(0,0,0,0.5); border:1px solid #3f4147; text-align:center; animation:slideUp 0.3s ease; }
+    @keyframes slideUp { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
+    .logo { margin-bottom:24px; }
+    .logo svg { width:64px; height:64px; }
+    h1 { font-size:26px; font-weight:800; margin-bottom:10px; }
+    .badge { display:inline-block; background:#5865F2; color:white; font-size:12px; font-weight:700; padding:3px 12px; border-radius:20px; margin-bottom:20px; letter-spacing:0.5px; }
+    p { color:#949ba4; font-size:14px; line-height:1.7; margin-bottom:28px; }
+    .status { display:flex; align-items:center; justify-content:center; gap:8px; background:#1e1f22; border:1px solid #3f4147; border-radius:10px; padding:12px 20px; font-size:14px; color:#57F287; font-weight:600; }
+    .dot { width:8px; height:8px; background:#57F287; border-radius:50%; animation:pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .footer { margin-top:24px; font-size:12px; color:#4e5058; }
+  </style>
+  </head>
+  <body>
+  <div class="container">
+    <div class="logo">
+      <svg viewBox="0 0 127.14 96.36" fill="#5865F2" xmlns="http://www.w3.org/2000/svg">
+        <path d="M107.7,8.07A105.15,105.15,0,0,0,81.47,0a72.06,72.06,0,0,0-3.36,6.83A97.68,97.68,0,0,0,49,6.83,72.37,72.37,0,0,0,45.64,0,105.89,105.89,0,0,0,19.39,8.09C2.79,32.65-1.71,56.6.54,80.21h0A105.73,105.73,0,0,0,32.71,96.36,77.7,77.7,0,0,0,39.6,85.25a68.42,68.42,0,0,1-10.85-5.18c.91-.66,1.8-1.34,2.66-2a75.57,75.57,0,0,0,64.32,0c.87.71,1.76,1.39,2.66,2a68.68,68.68,0,0,1-10.87,5.19,77,77,0,0,0,6.89,11.1A105.25,105.25,0,0,0,126.6,80.22h0C129.24,52.84,122.09,29.11,107.7,8.07ZM42.45,65.69C36.18,65.69,31,60,31,53s5-12.74,11.43-12.74S54,46,53.89,53,48.84,65.69,42.45,65.69Zm42.24,0C78.41,65.69,73.25,60,73.25,53s5-12.74,11.44-12.74S96.23,46,96.12,53,91.08,65.69,84.69,65.69Z"/>
+      </svg>
+    </div>
+    <h1>Discord 인증 봇</h1>
+    <div class="badge">VERIFICATION SYSTEM</div>
+    <p>이 페이지는 Discord 서버 인증 시스템입니다.<br>인증은 Discord 서버 내 인증 패널을 통해 진행됩니다.</p>
+    <div class="status">
+      <div class="dot"></div>
+      서버 정상 운영 중
+    </div>
+    <div class="footer">Discord 인증 봇 · Powered by Render</div>
+  </div>
+  </body>
+  </html>

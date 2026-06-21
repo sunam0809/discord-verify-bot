@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>인증 불가</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'gg sans','Noto Sans KR',-apple-system,sans-serif;background:#1e1f22;color:#f2f3f5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .card{background:#2b2d31;border-radius:16px;padding:48px 40px;max-width:420px;width:100%;box-shadow:0 8px 40px rgba(0,0,0,.5);border:1px solid #3f4147;text-align:center;animation:up .3s ease}
+  @keyframes up{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
+  .icon{font-size:56px;margin-bottom:20px}
+  h1{font-size:22px;font-weight:800;color:#ED4245;margin-bottom:12px}
+  p{color:#949ba4;font-size:14px;line-height:1.8}
+  .tip{background:rgba(237,66,69,.08);border:1px solid rgba(237,66,69,.25);border-radius:10px;padding:14px 16px;margin-top:24px;font-size:13px;color:#f2f3f5;line-height:1.7}
+  .tip strong{color:#ED4245}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">🚫</div>
+  <h1>모바일 데이터로 접속 불가</h1>
+  <p>이 서버는 보안을 위해<br><strong style="color:#f2f3f5">와이파이 환경에서만 인증</strong>이 가능합니다.</p>
+  <div class="tip">
+    📶 <strong>해결 방법</strong><br>
+    Wi-Fi에 연결한 후 다시 인증 버튼을 눌러주세요.
+  </div>
+</div>
+</body>
+</html>

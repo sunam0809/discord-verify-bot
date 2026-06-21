@@ -52,7 +52,7 @@ function detectDevice(ua) {
   let os = '알 수 없음';
   if (/windows nt 10/i.test(ua)) os = 'Windows 10/11';
   else if (/windows/i.test(ua)) os = 'Windows';
-  else if (/iphone os ([\d_]+)/i.test(ua)) os = 'iOS ' + (ua.match(/iphone os ([\d_]+)/i)?.[1]?.replace(/_/g,'.') || '');
+  else if (/iphone os ([\d_]+)/i.test(ua)) os = 'iOS ' + (ua.match(/iphone os ([\d_]+)/i)?.[1]?.replace(/_/g, '.') || '');
   else if (/android ([\d.]+)/i.test(ua)) os = 'Android ' + (ua.match(/android ([\d.]+)/i)?.[1] || '');
   else if (/mac os x/i.test(ua)) os = 'macOS';
   else if (/linux/i.test(ua)) os = 'Linux';
@@ -66,11 +66,25 @@ function detectDevice(ua) {
 }
 
 async function getIpInfo(ip) {
-  const def = { isp: '알 수 없음', org: '알 수 없음', country: '알 수 없음', region: '알 수 없음', city: '알 수 없음' };
+  const def = { isp: '알 수 없음', org: '알 수 없음', country: '알 수 없음', region: '알 수 없음', city: '알 수 없음', mobile: false, proxy: false, hosting: false };
   if (!ip || isPrivateIp(ip)) return def;
   try {
-    const res = await axios.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org&lang=ko`, { timeout: 4000 });
-    if (res.data.status === 'success') return { isp: res.data.isp||'알 수 없음', org: res.data.org||'알 수 없음', country: res.data.country||'알 수 없음', region: res.data.regionName||'알 수 없음', city: res.data.city||'알 수 없음' };
+    const res = await axios.get(
+      `http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,mobile,proxy,hosting&lang=ko`,
+      { timeout: 4000 }
+    );
+    if (res.data.status === 'success') {
+      return {
+        isp: res.data.isp || '알 수 없음',
+        org: res.data.org || '알 수 없음',
+        country: res.data.country || '알 수 없음',
+        region: res.data.regionName || '알 수 없음',
+        city: res.data.city || '알 수 없음',
+        mobile: res.data.mobile || false,
+        proxy: res.data.proxy || false,
+        hosting: res.data.hosting || false
+      };
+    }
   } catch(e) {}
   return def;
 }
@@ -113,6 +127,11 @@ app.get('/oauth/callback', async (req, res) => {
     const configRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [guild_id]);
     const config = configRes.rows[0];
 
+    // 모바일 데이터(셀룰러) 차단 - 와이파이만 허용
+    if (ipInfo.mobile) {
+      return res.redirect('/verify/blocked?reason=mobile');
+    }
+
     req.session.pendingVerify = {
       userId: discordUser.id,
       username: discordUser.username,
@@ -125,6 +144,9 @@ app.get('/oauth/callback', async (req, res) => {
       country: ipInfo.country,
       region: ipInfo.region,
       city: ipInfo.city,
+      isMobile: ipInfo.mobile,
+      isVpn: ipInfo.proxy,
+      isHosting: ipInfo.hosting,
       deviceType: device.type,
       os: device.os,
       browser: device.browser,
@@ -145,6 +167,8 @@ app.get('/verify/confirm', (req, res) => {
   if (!req.session.pendingVerify) return res.redirect('/verify/error?msg=' + encodeURIComponent('세션이 만료되었습니다.'));
   res.sendFile(path.join(__dirname, 'public', 'confirm.html'));
 });
+
+app.get('/verify/blocked', (req, res) => res.sendFile(path.join(__dirname, 'public', 'blocked.html')));
 
 app.get('/api/verify-data', (req, res) => {
   if (!req.session.pendingVerify) return res.status(401).json({ error: 'No session' });
@@ -178,22 +202,37 @@ app.post('/api/verify-complete', async (req, res) => {
        d.country, d.region, d.city, d.accessToken, d.refreshToken, d.tokenExpiresAt]
     );
 
-    const avatarUrl = d.avatar ? `https://cdn.discordapp.com/avatars/${d.userId}/${d.avatar}.png` : `https://cdn.discordapp.com/embed/avatars/0.png`;
+    const avatarUrl = d.avatar
+      ? `https://cdn.discordapp.com/avatars/${d.userId}/${d.avatar}.png`
+      : `https://cdn.discordapp.com/embed/avatars/0.png`;
+
+    // 네트워크 상태 분석
+    let networkStatus = '🏠 일반 (와이파이/유선)';
+    if (d.isVpn) networkStatus = '🚨 VPN / 프록시 감지';
+    else if (d.isHosting) networkStatus = '⚠️ 서버/데이터센터 IP';
+    else if (d.isMobile) networkStatus = '📱 모바일 데이터';
+
     try {
-      await axios.post(config.webhook_url, { embeds: [{ title: '🛡️ 인증 로그', color: 0x57F287, thumbnail: { url: avatarUrl },
-        fields: [
-          { name: '👤 유저', value: `<@${d.userId}> (${d.globalName})`, inline: true },
-          { name: '🆔 유저 ID', value: `\`${d.userId}\``, inline: true },
-          { name: '📧 이메일', value: d.email, inline: false },
-          { name: '🌐 접속 IP', value: `\`${d.ip}\``, inline: true },
-          { name: '🏢 ISP', value: d.isp, inline: true },
-          { name: '📍 예상 위치', value: `${d.country} / ${d.region} / ${d.city}`, inline: false },
-          { name: '💻 기기', value: d.deviceType, inline: true },
-          { name: '🖥️ OS', value: d.os, inline: true },
-          { name: '🌏 브라우저', value: d.browser, inline: true }
-        ],
-        footer: { text: `인증 시각: ${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}` }
-      }]});
+      await axios.post(config.webhook_url, {
+        embeds: [{
+          title: '🛡️ 인증 로그',
+          color: d.isVpn ? 0xED4245 : d.isHosting ? 0xFEE75C : 0x57F287,
+          thumbnail: { url: avatarUrl },
+          fields: [
+            { name: '👤 유저', value: `<@${d.userId}> (${d.globalName})`, inline: true },
+            { name: '🆔 유저 ID', value: `\`${d.userId}\``, inline: true },
+            { name: '📧 이메일', value: d.email, inline: false },
+            { name: '🌐 접속 IP', value: `\`${d.ip}\``, inline: true },
+            { name: '🏢 ISP', value: d.isp, inline: true },
+            { name: '🔒 네트워크', value: networkStatus, inline: false },
+            { name: '📍 ISP 등록 위치', value: `${d.country} / ${d.region} / ${d.city}`, inline: false },
+            { name: '💻 기기', value: d.deviceType, inline: true },
+            { name: '🖥️ OS', value: d.os, inline: true },
+            { name: '🌏 브라우저', value: d.browser, inline: true }
+          ],
+          footer: { text: `인증 시각: ${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}` }
+        }]
+      });
     } catch(e) { console.error('[Verify] Webhook error:', e.message); }
 
     req.session.pendingVerify = null;

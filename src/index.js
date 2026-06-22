@@ -11,6 +11,7 @@ let lastBotError = null;
 let loginAttempts = 0;
 let retryDelay = 5000;
 let connecting = false;
+let retryTimer = null;
 
 process.on('uncaughtException', (err) => {
   console.error('[Process] Uncaught exception:', err.message);
@@ -27,73 +28,87 @@ app.get('/bot-status', (req, res) => {
     uptime: c?.uptime ? Math.floor(c.uptime / 1000) + 's' : null,
     loginAttempts,
     lastError: lastBotError,
-    nextRetryMs: retryDelay
+    nextRetryMs: retryDelay,
+    connecting
   });
 });
 
 async function selfPing() {
   try {
     await axios.get(`${BASE_URL}/health`, { timeout: 8000 });
+    console.log('[Ping] OK');
   } catch (e) {
     console.warn('[Ping] Failed:', e.message);
   }
 }
 
 async function connectBot() {
-  if (connecting) return;
+  if (connecting) {
+    console.log('[Bot] Already connecting, skip.');
+    return;
+  }
   connecting = true;
   loginAttempts++;
-  console.log(`[Bot] Connecting... attempt #${loginAttempts}`);
+  console.log(`[Bot] Connecting attempt #${loginAttempts}...`);
 
-  // 이전 클라이언트 정리
   if (clientStore.current) {
     try { clientStore.current.destroy(); } catch (_) {}
     clientStore.current = null;
   }
 
-  try {
-    const client = createClient();
-    clientStore.current = client;
+  const client = createClient();
+  clientStore.current = client;
 
-    await Promise.race([
-      new Promise((resolve, reject) => {
-        client.once('ready', resolve);
-        client.once('error', reject);
-        client.login(process.env.BOT_TOKEN).catch(reject);
-      }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Connection timeout (120s)')), 120000)
-      )
-    ]);
+  const timer = setTimeout(() => {
+    console.error('[Bot] Timeout! No READY in 60s.');
+    connecting = false;
+    lastBotError = 'Connection timeout (60s)';
+    try { client.destroy(); } catch(_) {}
+    clientStore.current = null;
+    retryDelay = Math.min(retryDelay * 2, 60000);
+    console.log(`[Bot] Retry in ${retryDelay/1000}s...`);
+    retryTimer = setTimeout(connectBot, retryDelay);
+  }, 60000);
 
-    client.on('shardDisconnect', (event) => {
-      console.warn(`[Bot] Disconnected (code ${event.code})`);
-      if (!connecting) {
-        console.log('[Bot] Reconnecting in 10s...');
-        setTimeout(connectBot, 10000);
-      }
-    });
-
-    client.on('error', (err) => {
-      console.error('[Bot] Client error:', err.message);
-    });
-
+  client.once('ready', () => {
+    clearTimeout(timer);
     lastBotError = null;
     retryDelay = 5000;
     connecting = false;
     console.log('[Bot] ✓ Ready as', client.user?.tag);
 
-  } catch (err) {
-    lastBotError = err.message;
-    console.error(`[Bot] Connect failed (attempt ${loginAttempts}): ${err.message}`);
-    if (clientStore.current) {
-      try { clientStore.current.destroy(); } catch (_) {}
-      clientStore.current = null;
+    client.on('shardDisconnect', (event) => {
+      console.warn(`[Bot] Disconnected (code ${event.code})`);
+      if (!connecting) {
+        console.log('[Bot] Reconnecting in 10s...');
+        retryTimer = setTimeout(connectBot, 10000);
+      }
+    });
+    client.on('error', (err) => {
+      console.error('[Bot] Client error:', err.message);
+    });
+  });
+
+  client.on('debug', (msg) => {
+    if (msg.includes('Heartbeat') || msg.includes('RESUME') || msg.includes('HELLO') || msg.includes('READY') || msg.includes('error') || msg.includes('Error')) {
+      console.log('[WS Debug]', msg.slice(0, 200));
     }
-    retryDelay = Math.min(retryDelay * 2, 60000);
+  });
+
+  try {
+    console.log('[Bot] Calling client.login()...');
+    await client.login(process.env.BOT_TOKEN);
+    console.log('[Bot] login() resolved, waiting for READY...');
+  } catch (err) {
+    clearTimeout(timer);
     connecting = false;
-    console.log(`[Bot] Retry in ${retryDelay / 1000}s...`);
-    setTimeout(connectBot, retryDelay);
+    lastBotError = err.message;
+    console.error(`[Bot] login() threw: ${err.message}`);
+    try { client.destroy(); } catch(_) {}
+    clientStore.current = null;
+    retryDelay = Math.min(retryDelay * 2, 60000);
+    console.log(`[Bot] Retry in ${retryDelay/1000}s...`);
+    retryTimer = setTimeout(connectBot, retryDelay);
   }
 }
 
@@ -103,7 +118,7 @@ async function main() {
   console.log('[DB] OK');
 
   app.listen(PORT, () => {
-    console.log(`[Web] Port ${PORT}`);
+    console.log(`[Web] Listening on port ${PORT}`);
   });
 
   if (process.env.REGISTER_COMMANDS === 'true') {
@@ -112,12 +127,12 @@ async function main() {
       .catch(err => console.error('[Bot] Commands error:', err.message));
   }
 
-  console.log('[Bot] Connecting now...');
+  console.log('[Bot] Starting connection...');
   connectBot();
 
   setInterval(selfPing, 60 * 1000);
   setTimeout(selfPing, 5000);
-  console.log(`[Ping] → ${BASE_URL}/health every 60s`);
+  console.log(`[Ping] Self-ping → ${BASE_URL}/health every 60s`);
 }
 
 main().catch(err => {

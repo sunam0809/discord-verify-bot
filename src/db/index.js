@@ -20,7 +20,7 @@ export async function initDB() {
     CREATE TABLE IF NOT EXISTS server_configs (
       guild_id TEXT PRIMARY KEY,
       role_id TEXT NOT NULL,
-      webhook_url TEXT NOT NULL,
+      webhook_url TEXT,
       panel_title TEXT NOT NULL DEFAULT '인증',
       panel_description TEXT NOT NULL DEFAULT '아래 버튼을 눌러 인증을 완료하세요.',
       channel_id TEXT
@@ -47,6 +47,8 @@ export async function initDB() {
       UNIQUE(user_id, guild_id)
     )
   `);
+
+  await query(`ALTER TABLE server_configs ALTER COLUMN webhook_url DROP NOT NULL`).catch(() => {});
 
   await query(`
     ALTER TABLE verified_users

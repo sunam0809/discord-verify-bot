@@ -8,6 +8,7 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 let lastBotError = null;
 let loginAttempts = 0;
+let cmdRegStatus = 'pending';
 
 process.on('uncaughtException', (err) => {
   console.error('[Process] Uncaught exception:', err.message);
@@ -22,7 +23,8 @@ app.get('/bot-status', (req, res) => {
     tag: client.user?.tag || null,
     uptime: client.uptime,
     loginAttempts,
-    lastError: lastBotError
+    lastError: lastBotError,
+    commandsStatus: cmdRegStatus
   });
 });
 
@@ -40,11 +42,10 @@ async function startBotSafe() {
   try {
     await startBot();
     lastBotError = null;
-    console.log('[Bot] ✓ Connected to Discord');
+    console.log('[Bot] ✓ Connected to Discord as', client.user?.tag);
   } catch (err) {
     lastBotError = err.message;
-    console.error(`[Bot] Login failed: ${err.message}`);
-    console.log('[Bot] Retrying in 30s...');
+    console.error(`[Bot] Login failed (attempt ${loginAttempts}): ${err.message}`);
     setTimeout(startBotSafe, 30000);
   }
 }
@@ -52,18 +53,19 @@ async function startBotSafe() {
 async function main() {
   console.log('[Main] Starting...');
   await initDB();
+  console.log('[DB] Connected ✓');
 
   app.listen(PORT, () => {
     console.log(`[Web] Running on port ${PORT}`);
   });
 
-  try {
-    await registerCommands();
-  } catch (err) {
-    console.error('[Bot] registerCommands failed:', err.message);
-  }
+  // 봇 연결을 먼저 시작 (registerCommands와 병렬)
+  startBotSafe();
 
-  await startBotSafe();
+  // 명령어 등록은 백그라운드에서 (봇 연결을 블로킹하지 않음)
+  registerCommands()
+    .then(() => { cmdRegStatus = 'ok'; console.log('[Bot] Commands registered ✓'); })
+    .catch(err => { cmdRegStatus = `error: ${err.message}`; console.error('[Bot] registerCommands failed:', err.message); });
 
   client.on('shardDisconnect', (event) => {
     console.warn(`[Bot] Disconnected (code ${event.code})`);

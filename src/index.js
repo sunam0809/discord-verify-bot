@@ -6,20 +6,38 @@ import axios from 'axios';
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-// 프로세스 크래시 방지
 process.on('uncaughtException', (err) => {
-  console.error('[Process] Uncaught exception (continuing):', err.message);
+  console.error('[Process] Uncaught exception:', err.message);
 });
 process.on('unhandledRejection', (reason) => {
-  console.error('[Process] Unhandled rejection (continuing):', reason);
+  console.error('[Process] Unhandled rejection:', reason);
+});
+
+// /bot-status 엔드포인트 - 봇 연결 상태 확인용
+app.get('/bot-status', (req, res) => {
+  res.json({
+    botReady: client.isReady(),
+    uptime: client.uptime,
+    tag: client.user?.tag || null
+  });
 });
 
 async function selfPing() {
   try {
     await axios.get(`${BASE_URL}/health`, { timeout: 8000 });
-    console.log('[Ping] OK -', new Date().toISOString());
   } catch (e) {
     console.warn('[Ping] Failed:', e.message);
+  }
+}
+
+async function startBotSafe() {
+  try {
+    await startBot();
+    console.log('[Bot] Connected to Discord ✓');
+  } catch (err) {
+    console.error('[Bot] Login failed:', err.message);
+    console.log('[Bot] Retrying in 30s...');
+    setTimeout(startBotSafe, 30000);
   }
 }
 
@@ -33,29 +51,22 @@ async function main() {
   });
 
   await registerCommands();
-  await startBot();
+  await startBotSafe();
 
-  // 봇 연결 끊김 감지
   client.on('shardDisconnect', (event, id) => {
-    console.warn(`[Bot] Shard ${id} disconnected. Code: ${event.code}`);
-  });
-  client.on('shardReconnecting', (id) => {
-    console.log(`[Bot] Shard ${id} reconnecting...`);
-  });
-  client.on('shardResume', (id, replayed) => {
-    console.log(`[Bot] Shard ${id} resumed. Replayed: ${replayed}`);
+    console.warn(`[Bot] Disconnected (code ${event.code}). Auto-reconnecting...`);
   });
   client.on('error', (err) => {
-    console.error('[Bot] Error:', err.message);
+    console.error('[Bot] Client error:', err.message);
   });
 
-  // 1분마다 자체 핑 (Render 슬립 방지)
+  // 1분마다 self-ping (Render 슬립 방지)
   setInterval(selfPing, 60 * 1000);
-  setTimeout(selfPing, 5000); // 시작 후 5초 뒤 첫 핑
-  console.log(`[Ping] Self-ping started every 1 min → ${BASE_URL}/health`);
+  setTimeout(selfPing, 5000);
+  console.log(`[Ping] Self-ping every 1min → ${BASE_URL}/health`);
 }
 
 main().catch(err => {
-  console.error('[Main] Fatal error:', err);
+  console.error('[Main] Fatal:', err);
   process.exit(1);
 });

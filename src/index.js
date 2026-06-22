@@ -6,6 +6,9 @@ import axios from 'axios';
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
+let lastBotError = null;
+let loginAttempts = 0;
+
 process.on('uncaughtException', (err) => {
   console.error('[Process] Uncaught exception:', err.message);
 });
@@ -13,12 +16,13 @@ process.on('unhandledRejection', (reason) => {
   console.error('[Process] Unhandled rejection:', reason);
 });
 
-// /bot-status 엔드포인트 - 봇 연결 상태 확인용
 app.get('/bot-status', (req, res) => {
   res.json({
     botReady: client.isReady(),
+    tag: client.user?.tag || null,
     uptime: client.uptime,
-    tag: client.user?.tag || null
+    loginAttempts,
+    lastError: lastBotError
   });
 });
 
@@ -31,11 +35,15 @@ async function selfPing() {
 }
 
 async function startBotSafe() {
+  loginAttempts++;
+  console.log(`[Bot] Login attempt #${loginAttempts}...`);
   try {
     await startBot();
-    console.log('[Bot] Connected to Discord ✓');
+    lastBotError = null;
+    console.log('[Bot] ✓ Connected to Discord');
   } catch (err) {
-    console.error('[Bot] Login failed:', err.message);
+    lastBotError = err.message;
+    console.error(`[Bot] Login failed: ${err.message}`);
     console.log('[Bot] Retrying in 30s...');
     setTimeout(startBotSafe, 30000);
   }
@@ -43,24 +51,27 @@ async function startBotSafe() {
 
 async function main() {
   console.log('[Main] Starting...');
-
   await initDB();
 
   app.listen(PORT, () => {
-    console.log(`[Web] Server running on port ${PORT}`);
+    console.log(`[Web] Running on port ${PORT}`);
   });
 
-  await registerCommands();
+  try {
+    await registerCommands();
+  } catch (err) {
+    console.error('[Bot] registerCommands failed:', err.message);
+  }
+
   await startBotSafe();
 
-  client.on('shardDisconnect', (event, id) => {
-    console.warn(`[Bot] Disconnected (code ${event.code}). Auto-reconnecting...`);
+  client.on('shardDisconnect', (event) => {
+    console.warn(`[Bot] Disconnected (code ${event.code})`);
   });
   client.on('error', (err) => {
-    console.error('[Bot] Client error:', err.message);
+    console.error('[Bot] Error:', err.message);
   });
 
-  // 1분마다 self-ping (Render 슬립 방지)
   setInterval(selfPing, 60 * 1000);
   setTimeout(selfPing, 5000);
   console.log(`[Ping] Self-ping every 1min → ${BASE_URL}/health`);

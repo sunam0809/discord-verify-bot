@@ -50,6 +50,10 @@ const BASE_URL = process.env.BASE_URL;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const REDIRECT_URI = `${BASE_URL}/oauth/callback`;
 
+// Cloudflare Worker 프록시 URL (설정 시 Discord API를 직접 호출하지 않음)
+// Render 환경변수에 OAUTH_PROXY_URL=https://your-worker.workers.dev 추가
+const OAUTH_PROXY_URL = process.env.OAUTH_PROXY_URL || null;
+
 function getRealIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (xff) {
@@ -95,10 +99,8 @@ const IP_CACHE_TTL = 5 * 60 * 1000;
 async function getIpInfo(ip) {
   const def = { isp: '알 수 없음', org: '알 수 없음', country: '알 수 없음', region: '알 수 없음', city: '알 수 없음', mobile: false, proxy: false, hosting: false };
   if (!ip || isPrivateIp(ip)) return def;
-
   const cached = ipCache.get(ip);
   if (cached && Date.now() < cached.expires) return cached.data;
-
   try {
     const res = await axios.get(
       `http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,mobile,proxy,hosting&lang=ko`,
@@ -120,30 +122,19 @@ async function getIpInfo(ip) {
   return def;
 }
 
-// ─── Discord API 재시도 래퍼 ────────────────────────────────────────────────
-// retry_after가 10초 초과면 재시도 의미 없으므로 즉시 에러 전파
-async function discordRequest(fn, maxRetries = 2) {
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await fn();
-    } catch (e) {
-      const status = e.response?.status;
-      if (status === 429 && i < maxRetries - 1) {
-        const retryAfter = parseFloat(
-          e.response.headers?.['retry-after'] || e.response.data?.retry_after || '60'
-        );
-        if (retryAfter > 10) {
-          console.warn(`[Discord] 429 장기 rate limit (${retryAfter}s) — 재시도 포기`);
-          throw e;
-        }
-        const wait = retryAfter * 1000 + 300;
-        console.warn(`[Discord] 429, ${wait}ms 후 재시도 (${i + 1}/${maxRetries})`);
-        await new Promise(r => setTimeout(r, wait));
-      } else {
-        throw e;
-      }
-    }
+// ─── Discord OAuth 토큰 교환 ─────────────────────────────────────────────────
+// OAUTH_PROXY_URL이 설정된 경우 Cloudflare Worker를 통해 요청 (rate limit 우회)
+// 미설정 시 Discord 직접 호출 (기존 방식)
+async function exchangeDiscordCode(params) {
+  const endpoint = OAUTH_PROXY_URL || 'https://discord.com/api/oauth2/token';
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+
+  if (OAUTH_PROXY_URL) {
+    console.log('[OAuth] Cloudflare Worker 프록시 사용:', OAUTH_PROXY_URL);
   }
+
+  const res = await axios.post(endpoint, params, { headers });
+  return res;
 }
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
@@ -165,17 +156,20 @@ app.get('/oauth/callback', async (req, res) => {
   const { code, state: guild_id } = req.query;
   if (!code) return res.redirect('/verify/error?msg=' + encodeURIComponent('인증 코드가 없습니다.'));
   try {
-    const tokenRes = await discordRequest(() => axios.post(
-      'https://discord.com/api/oauth2/token',
-      new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    ));
+    // Discord 토큰 교환 (프록시 또는 직접 호출)
+    const tokenRes = await exchangeDiscordCode(new URLSearchParams({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT_URI,
+    }));
+
     const { access_token, refresh_token, expires_in } = tokenRes.data;
     const expiresAt = new Date(Date.now() + expires_in * 1000);
-    const userRes = await discordRequest(() => axios.get(
-      'https://discord.com/api/users/@me',
-      { headers: { Authorization: `Bearer ${access_token}` } }
-    ));
+    const userRes = await axios.get('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
     const discordUser = userRes.data;
     const realIp = getRealIp(req);
     const device = detectDevice(req.headers['user-agent'] || '');
@@ -199,12 +193,9 @@ app.get('/oauth/callback', async (req, res) => {
     res.redirect('/verify/confirm');
   } catch (err) {
     const status = err.response?.status;
-    const retryAfter = parseFloat(err.response?.data?.retry_after || err.response?.headers?.['retry-after'] || 0);
-    console.error('[OAuth] Error:', status, err.response?.data || err.message, 'retry_after:', retryAfter);
-
+    console.error('[OAuth] Error:', status, err.response?.data || err.message);
     let userMsg;
     if (status === 429) {
-      // retry_after 값은 절대 그대로 노출하지 않음
       userMsg = 'Discord 서버 응답 제한으로 인해 잠시 인증이 불가합니다. 몇 분 후 다시 시도해 주세요.';
     } else {
       userMsg = '인증 처리 중 오류가 발생했습니다. (' + (err.response?.data?.error_description || err.response?.data?.error || err.message) + ')';
@@ -233,7 +224,6 @@ app.post('/api/verify-complete', async (req, res) => {
     const configRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [d.guild_id]);
     if (configRes.rows.length === 0) return res.json({ success: false, error: '서버 설정을 찾을 수 없습니다.' });
     const config = configRes.rows[0];
-
     try {
       await axios.put(
         `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}`,
@@ -242,7 +232,7 @@ app.post('/api/verify-complete', async (req, res) => {
       );
     } catch(e) {
       if (e.response?.status === 204 || e.response?.status === 200) {
-        // Already in guild
+        // 이미 서버에 있음
       } else {
         try {
           await axios.put(
@@ -253,7 +243,6 @@ app.post('/api/verify-complete', async (req, res) => {
         } catch(e2) { console.error('[Verify] Role error:', e2.message); }
       }
     }
-
     await query(
       `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
@@ -263,7 +252,6 @@ app.post('/api/verify-complete', async (req, res) => {
       [d.userId, d.guild_id, d.username, d.email, d.ip, d.isp, d.org,
        d.country, d.region, d.city, d.accessToken, d.refreshToken, d.tokenExpiresAt]
     );
-
     if (config.webhook_url) {
       const avatarUrl = d.avatar
         ? `https://cdn.discordapp.com/avatars/${d.userId}/${d.avatar}.png`
@@ -272,7 +260,6 @@ app.post('/api/verify-complete', async (req, res) => {
       if (d.isVpn) networkStatus = '🚨 VPN / 프록시 감지';
       else if (d.isHosting) networkStatus = '⚠️ 서버/데이터센터 IP';
       else if (d.isMobile) networkStatus = '📱 모바일 데이터';
-
       try {
         await axios.post(config.webhook_url, {
           embeds: [{
@@ -296,7 +283,6 @@ app.post('/api/verify-complete', async (req, res) => {
         });
       } catch(e) { console.error('[Verify] Webhook error:', e.message); }
     }
-
     req.session.pendingVerify = null;
     res.json({ success: true });
   } catch(err) {

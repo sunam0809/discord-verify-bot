@@ -7,14 +7,14 @@ const APP_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const BASE_URL = process.env.BASE_URL;
 
-async function withRetry(fn, maxAttempts = 4) {
+async function withRetry(fn, maxAttempts = 6) {
   for (let i = 0; i < maxAttempts; i++) {
     try {
       return await fn();
     } catch(e) {
       if (e.response?.status === 429 && i < maxAttempts - 1) {
-        const retryAfter = parseFloat(e.response.headers?.['retry-after'] || '2');
-        const wait = Math.min(retryAfter * 1000 + 500, 12000);
+        const retryAfter = parseFloat(e.response.headers?.['retry-after'] || e.response.data?.retry_after || '5');
+        const wait = Math.min(retryAfter * 1000 + 500, 15000);
         console.warn(`[Retry] 429 rate limit, waiting ${wait}ms (attempt ${i + 1}/${maxAttempts})`);
         await new Promise(r => setTimeout(r, wait));
       } else {
@@ -27,28 +27,28 @@ async function withRetry(fn, maxAttempts = 4) {
 async function editReply(token, content) {
   const payload = typeof content === 'string' ? { content } : content;
   try {
-    await axios.patch(
+    await withRetry(() => axios.patch(
       `https://discord.com/api/v10/webhooks/${APP_ID}/${token}/messages/@original`,
       payload,
-      { headers: { 'Content-Type': 'application/json' }, timeout: 8000 }
-    );
+      { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
+    ));
     console.log('[editReply] OK');
   } catch(e) {
     console.error('[editReply] FAILED:', e.response?.status, JSON.stringify(e.response?.data), e.message);
   }
 }
 
-// 인터랙션 토큰으로 채널에 공개 메시지 전송 (Bot 토큰 불필요)
 async function sendFollowup(token, payload) {
   try {
-    await axios.post(
+    await withRetry(() => axios.post(
       `https://discord.com/api/v10/webhooks/${APP_ID}/${token}`,
       payload,
-      { headers: { 'Content-Type': 'application/json' }, timeout: 8000 }
-    );
+      { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
+    ));
     console.log('[sendFollowup] OK');
   } catch(e) {
     console.error('[sendFollowup] FAILED:', e.response?.status, JSON.stringify(e.response?.data), e.message);
+    throw e;
   }
 }
 
@@ -94,7 +94,7 @@ export async function handleHttpInteraction(interaction, res) {
   const guildId = interaction.guild_id;
   const token = interaction.token;
 
-  console.log('[Interaction] type:', interaction.type, 'name:', interaction.data?.name, 'userId:', userId, 'guildId:', guildId);
+  console.log('[Interaction] type:', interaction.type, 'name:', interaction.data?.name, 'userId:', userId);
 
   // ── 버튼 ──
   if (interaction.type === 3) {
@@ -132,18 +132,15 @@ export async function handleHttpInteraction(interaction, res) {
           query(`SELECT COUNT(*) FROM verified_users WHERE guild_id=$1 AND verified_at >= NOW() - INTERVAL '24 hours'`, [guildId]),
           query(`SELECT COUNT(*) FROM verified_users WHERE guild_id=$1 AND verified_at >= NOW() - INTERVAL '7 days'`, [guildId])
         ]);
-        const total = parseInt(totalR.rows[0].count);
-        const today = parseInt(todayR.rows[0].count);
-        const week = parseInt(weekR.rows[0].count);
         return res.json({
           type: 4,
           data: {
             embeds: [{
               title: '📊 인증 현황', color: 0x5865F2,
               fields: [
-                { name: '✅ 전체 인증 수', value: `**${total.toLocaleString()}명**`, inline: true },
-                { name: '📅 오늘 인증', value: `**${today.toLocaleString()}명**`, inline: true },
-                { name: '📆 이번 주 인증', value: `**${week.toLocaleString()}명**`, inline: true }
+                { name: '✅ 전체 인증 수', value: `**${parseInt(totalR.rows[0].count).toLocaleString()}명**`, inline: true },
+                { name: '📅 오늘 인증', value: `**${parseInt(todayR.rows[0].count).toLocaleString()}명**`, inline: true },
+                { name: '📆 이번 주 인증', value: `**${parseInt(weekR.rows[0].count).toLocaleString()}명**`, inline: true }
               ],
               timestamp: new Date().toISOString()
             }],
@@ -151,7 +148,6 @@ export async function handleHttpInteraction(interaction, res) {
           }
         });
       } catch(err) {
-        console.error('[인증수] Error:', err.message);
         return res.json({ type: 4, data: { content: `❌ 오류: ${err.message}`, flags: 64 } });
       }
     }
@@ -178,12 +174,11 @@ export async function handleHttpInteraction(interaction, res) {
           }
         });
       } catch(err) {
-        console.error('[복구키생성] Error:', err.message);
         return res.json({ type: 4, data: { content: `❌ 오류: ${err.message}`, flags: 64 } });
       }
     }
 
-    // ─── 인증창 ─── (deferred → DB저장 → 인터랙션 토큰으로 패널 전송)
+    // ─── 인증창 ───
     if (name === '인증창') {
       const roleId = interaction.data.options?.find(o => o.name === '역할')?.value;
       const webhook = getOption(interaction, '웹훅') || null;
@@ -195,10 +190,8 @@ export async function handleHttpInteraction(interaction, res) {
       // 즉시 deferred 응답 (3초 이내 필수)
       res.json({ type: 5, data: { flags: 64 } });
 
-      // 이하 백그라운드 처리
       setImmediate(async () => {
         try {
-          // 1. DB 저장
           await query(
             `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
              VALUES ($1,$2,$3,$4,$5,$6)
@@ -207,7 +200,6 @@ export async function handleHttpInteraction(interaction, res) {
           );
           console.log('[인증창] DB saved');
 
-          // 2. 인증 패널 (인터랙션 followup으로 채널에 공개 전송 — Bot 토큰 rate limit 없음)
           const panelPayload = {
             embeds: [{
               title,
@@ -221,13 +213,14 @@ export async function handleHttpInteraction(interaction, res) {
             }]
           };
 
+          // 인터랙션 토큰으로 채널에 공개 패널 전송 (retry 포함)
           await sendFollowup(token, panelPayload);
+          console.log('[인증창] Panel sent');
 
-          // 3. 완료 메시지 (ephemeral 원본 응답 수정)
+          // 완료 메시지로 thinking 해제 (retry 포함)
           await editReply(token, {
             content: '✅ 인증 패널이 생성되었습니다.' + (webhook ? '' : '\n> ⚠️ 웹훅 미설정 — 인증 로그가 전송되지 않습니다.')
           });
-
         } catch(err) {
           console.error('[인증창] Error:', err.message, err.response?.data);
           await editReply(token, `❌ 오류 발생: ${err.message}`).catch(() => {});
@@ -243,7 +236,6 @@ export async function handleHttpInteraction(interaction, res) {
         const keyInput = getOption(interaction, '키');
         if (!keyInput) { await editReply(token, '❌ 키를 입력해주세요.'); return; }
         const key = keyInput.toUpperCase().trim();
-        console.log('[복구키사용] key:', key);
         const keyRes = await query('SELECT * FROM recovery_keys WHERE recovery_key=$1', [key]);
         if (keyRes.rows.length === 0) { await editReply(token, '❌ 유효하지 않은 키입니다.'); return; }
         const keyData = keyRes.rows[0];

@@ -5,11 +5,32 @@ import axios from 'axios';
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-process.on('uncaughtException', (err) => console.error('[Process] Uncaught:', err.message));
-process.on('unhandledRejection', (reason) => console.error('[Process] Rejection:', reason));
+// 인메모리 로그 버퍼 (최근 200줄)
+const logBuffer = [];
+function pushLog(level, ...args) {
+  const line = `[${new Date().toISOString()}] [${level}] ${args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')}`;
+  logBuffer.push(line);
+  if (logBuffer.length > 200) logBuffer.shift();
+}
+const _err = console.error.bind(console);
+const _log = console.log.bind(console);
+const _warn = console.warn.bind(console);
+console.error = (...a) => { _err(...a); pushLog('ERR', ...a); };
+console.log = (...a) => { _log(...a); pushLog('LOG', ...a); };
+console.warn = (...a) => { _warn(...a); pushLog('WRN', ...a); };
+
+global._logBuffer = logBuffer;
+
+process.on('uncaughtException', (err) => console.error('[Process] Uncaught:', err.message, err.stack));
+process.on('unhandledRejection', (reason) => console.error('[Process] Rejection:', String(reason)));
 
 app.get('/bot-status', (req, res) => {
   res.json({ mode: 'http-interactions', status: 'online' });
+});
+
+app.get('/debug-log', (req, res) => {
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.send((global._logBuffer || []).join('\n') || '(no logs yet)');
 });
 
 async function selfPing() {
@@ -18,13 +39,12 @@ async function selfPing() {
 }
 
 async function main() {
-  console.log('[Main] Starting (HTTP Interactions mode)...');
+  console.log('[Main] Starting HTTP Interactions mode...');
   await initDB();
-  console.log('[DB] OK');
-  app.listen(PORT, () => console.log(`[Web] Port ${PORT}`));
+  console.log('[DB] Connected');
+  app.listen(PORT, () => console.log(`[Web] Listening on port ${PORT}`));
   setInterval(selfPing, 60 * 1000);
   setTimeout(selfPing, 5000);
-  console.log(`[Ping] Self-ping → ${BASE_URL}/health every 60s`);
 }
 
-main().catch(err => { console.error('[Main] Fatal:', err); process.exit(1); });
+main().catch(err => { console.error('[Main] Fatal:', err.message); process.exit(1); });

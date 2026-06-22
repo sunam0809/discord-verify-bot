@@ -41,7 +41,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'verify_secret_key',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 10 * 60 * 1000 }
+  cookie: { secure: process.env.NODE_ENV === 'production', maxAge: 10 * 60 * 1000 }
 }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -156,8 +156,9 @@ app.get('/oauth/callback', async (req, res) => {
     };
     res.redirect('/verify/confirm');
   } catch (err) {
-    console.error('[OAuth] Error:', err.response?.data || err.message);
-    res.redirect('/verify/error?msg=' + encodeURIComponent('인증 처리 중 오류가 발생했습니다.'));
+    const oauthErr = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    console.error('[OAuth] Error:', oauthErr);
+    res.redirect('/verify/error?msg=' + encodeURIComponent('인증 처리 중 오류가 발생했습니다. (' + (err.response?.data?.error_description || err.response?.data?.error || err.message) + ')'));
   }
 });
 

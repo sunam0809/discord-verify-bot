@@ -28,6 +28,27 @@ app.get('/bot-status', (req, res) => {
   });
 });
 
+// Discord API 연결 테스트 (토큰 유효성 + 네트워크 체크)
+app.get('/discord-test', async (req, res) => {
+  const results = {};
+  try {
+    const gw = await axios.get('https://discord.com/api/v10/gateway', { timeout: 10000 });
+    results.gateway = { ok: true, url: gw.data.url };
+  } catch (e) {
+    results.gateway = { ok: false, error: e.message };
+  }
+  try {
+    const me = await axios.get('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: `Bot ${process.env.BOT_TOKEN}` },
+      timeout: 10000
+    });
+    results.botToken = { ok: true, id: me.data.id, username: me.data.username };
+  } catch (e) {
+    results.botToken = { ok: false, status: e.response?.status, error: e.message };
+  }
+  res.json(results);
+});
+
 async function selfPing() {
   try {
     await axios.get(`${BASE_URL}/health`, { timeout: 8000 });
@@ -42,7 +63,7 @@ async function startBotSafe() {
   try {
     await startBot();
     lastBotError = null;
-    console.log('[Bot] ✓ Connected to Discord as', client.user?.tag);
+    console.log('[Bot] ✓ Connected as', client.user?.tag);
   } catch (err) {
     lastBotError = err.message;
     console.error(`[Bot] Login failed (attempt ${loginAttempts}): ${err.message}`);
@@ -59,10 +80,8 @@ async function main() {
     console.log(`[Web] Running on port ${PORT}`);
   });
 
-  // 봇 연결을 먼저 시작 (registerCommands와 병렬)
   startBotSafe();
 
-  // 명령어 등록은 백그라운드에서 (봇 연결을 블로킹하지 않음)
   registerCommands()
     .then(() => { cmdRegStatus = 'ok'; console.log('[Bot] Commands registered ✓'); })
     .catch(err => { cmdRegStatus = `error: ${err.message}`; console.error('[Bot] registerCommands failed:', err.message); });
@@ -76,7 +95,6 @@ async function main() {
 
   setInterval(selfPing, 60 * 1000);
   setTimeout(selfPing, 5000);
-  console.log(`[Ping] Self-ping every 1min → ${BASE_URL}/health`);
 }
 
 main().catch(err => {

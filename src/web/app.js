@@ -5,7 +5,7 @@ import axios from 'axios';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { query } from '../db/index.js';
-import { clientStore } from '../bot/clientStore.js';
+import { client } from '../bot/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -185,7 +185,7 @@ app.post('/api/verify-complete', async (req, res) => {
     const config = configRes.rows[0];
 
     try {
-      const guild = clientStore.current?.guilds.cache.get(d.guild_id);
+      const guild = client.guilds.cache.get(d.guild_id);
       if (guild) {
         const member = await guild.members.fetch(d.userId).catch(() => null);
         if (member) await member.roles.add(config.role_id);

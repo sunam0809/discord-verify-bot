@@ -193,12 +193,13 @@ export async function handleHttpInteraction(interaction, res) {
           [guildId, roleId, webhook, title, description, channelId]
         );
         console.log('[인증창] DB saved, fetching guild...');
-        const guild = await getGuild(guildId);
-        console.log('[인증창] Guild:', guild.name, 'sending panel to channel:', channelId);
+        let guild = null;
+        try { guild = await getGuild(guildId); } catch(gErr) { console.warn('[인증창] getGuild skipped:', gErr.response?.status, gErr.message); }
+        console.log('[인증창] Guild:', guild?.name || '(rate limited)', 'sending panel to channel:', channelId);
         await sendToChannel(channelId, {
           embeds: [{
             title, description, color: 0x5865F2,
-            footer: { text: guild.name, icon_url: guildIcon(guildId, guild.icon) },
+            ...(guild ? { footer: { text: guild.name, icon_url: guildIcon(guildId, guild.icon) } } : {}),
             timestamp: new Date().toISOString()
           }],
           components: [{

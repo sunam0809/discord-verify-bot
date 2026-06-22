@@ -9,12 +9,10 @@ const ALLOWED_USER_ID = '1368030640628301865';
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 
+// Guilds 인텐트만 사용 (슬래시 명령어에 필요한 것만)
+// GuildMembers/GuildMessages는 Privileged Intent라 포털 활성화 없이 쓰면 봇이 4014로 강제종료됨
 export const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages
-  ]
+  intents: [GatewayIntentBits.Guilds]
 });
 
 const commands = [인증창Command, 복구키생성Command, 복구키사용Command, 인증수Command];

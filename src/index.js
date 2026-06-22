@@ -8,7 +8,8 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 let lastBotError = null;
 let loginAttempts = 0;
-let retryDelay = 15000; // 지수 백오프 시작값
+let retryDelay = 20000;
+let connecting = false;
 
 process.on('uncaughtException', (err) => {
   console.error('[Process] Uncaught exception:', err.message);
@@ -21,10 +22,10 @@ app.get('/bot-status', (req, res) => {
   res.json({
     botReady: client.isReady(),
     tag: client.user?.tag || null,
-    uptime: client.uptime,
+    uptime: client.uptime ? Math.floor(client.uptime / 1000) + 's' : null,
     loginAttempts,
     lastError: lastBotError,
-    nextRetryDelay: retryDelay
+    nextRetryMs: retryDelay
   });
 });
 
@@ -36,57 +37,87 @@ async function selfPing() {
   }
 }
 
-async function startBotSafe() {
+async function connectBot() {
+  if (connecting) return;
+  connecting = true;
   loginAttempts++;
-  console.log(`[Bot] Login attempt #${loginAttempts} (delay was ${retryDelay}ms)...`);
+  console.log(`[Bot] Connecting... attempt #${loginAttempts}`);
+
   try {
-    await startBot();
+    // login() + READY 이벤트 둘 다 90초 내에 완료돼야 함
+    await Promise.race([
+      new Promise(async (resolve, reject) => {
+        try {
+          await startBot();
+          // login()이 resolve된 후 READY 기다리기
+          if (client.isReady()) {
+            resolve();
+          } else {
+            client.once('ready', resolve);
+          }
+        } catch (e) {
+          reject(e);
+        }
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Connection timeout (90s)')), 90000)
+      )
+    ]);
+
     lastBotError = null;
-    retryDelay = 15000; // 성공 시 리셋
-    console.log('[Bot] ✓ Connected as', client.user?.tag);
+    retryDelay = 20000;
+    connecting = false;
+    console.log('[Bot] ✓ Ready as', client.user?.tag);
+
   } catch (err) {
     lastBotError = err.message;
-    console.error(`[Bot] Login failed: ${err.message}`);
-    // 지수 백오프: 15s → 30s → 60s → 120s → 최대 300s
+    console.error(`[Bot] Connect failed (attempt ${loginAttempts}): ${err.message}`);
+    // 클라이언트 리셋
+    try { client.destroy(); } catch (_) {}
     retryDelay = Math.min(retryDelay * 2, 300000);
-    console.log(`[Bot] Retrying in ${retryDelay / 1000}s...`);
-    setTimeout(startBotSafe, retryDelay);
+    connecting = false;
+    console.log(`[Bot] Retry in ${retryDelay / 1000}s...`);
+    setTimeout(connectBot, retryDelay);
   }
 }
+
+// 봇이 끊기면 자동 재연결
+client.on('shardDisconnect', async (event) => {
+  console.warn(`[Bot] Disconnected (code ${event.code})`);
+  if (!connecting) {
+    console.log('[Bot] Scheduling reconnect in 15s...');
+    setTimeout(connectBot, 15000);
+  }
+});
+
+client.on('error', (err) => {
+  console.error('[Bot] Client error:', err.message);
+});
 
 async function main() {
   console.log('[Main] Starting...');
   await initDB();
-  console.log('[DB] Connected ✓');
+  console.log('[DB] OK');
 
   app.listen(PORT, () => {
-    console.log(`[Web] Running on port ${PORT}`);
+    console.log(`[Web] Port ${PORT}`);
   });
 
-  // registerCommands는 REGISTER_COMMANDS=true 일 때만 실행 (Rate Limit 방지)
-  // 명령어는 한 번만 등록하면 Discord에 영구 저장됨
+  // registerCommands는 최초 1회만 (env var로 제어)
   if (process.env.REGISTER_COMMANDS === 'true') {
     registerCommands()
-      .then(() => console.log('[Bot] Commands registered ✓'))
-      .catch(err => console.error('[Bot] registerCommands failed:', err.message));
-  } else {
-    console.log('[Bot] Skipping registerCommands (already registered)');
+      .then(() => console.log('[Bot] Commands registered'))
+      .catch(err => console.error('[Bot] Commands error:', err.message));
   }
 
-  // 봇 연결 (30초 후 시작 - Rate Limit 429 회복 대기)
-  console.log('[Bot] Waiting 30s before connecting (Discord rate limit recovery)...');
-  setTimeout(startBotSafe, 30000);
+  // 30초 후 첫 연결 시도 (Rate Limit 회복 여유 시간)
+  console.log('[Bot] First connect in 30s...');
+  setTimeout(connectBot, 30000);
 
-  client.on('shardDisconnect', (event) => {
-    console.warn(`[Bot] Disconnected (code ${event.code}), will auto-reconnect...`);
-  });
-  client.on('error', (err) => {
-    console.error('[Bot] Error:', err.message);
-  });
-
+  // 1분마다 self-ping (Render 슬립 방지)
   setInterval(selfPing, 60 * 1000);
   setTimeout(selfPing, 5000);
-  console.log(`[Ping] Self-ping every 1min → ${BASE_URL}/health`);
+  console.log(`[Ping] → ${BASE_URL}/health every 60s`);
 }
 
 main().catch(err => {

@@ -30,27 +30,32 @@ client.once('ready', () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
-  if (interaction.isButton()) {
-    await handleButtonInteraction(interaction);
-    return;
-  }
-
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.user.id !== ALLOWED_USER_ID) {
-    return interaction.reply({ content: '❌ 이 명령어를 사용할 권한이 없습니다.', ephemeral: true });
-  }
-
   try {
+    if (interaction.isButton()) {
+      await handleButtonInteraction(interaction);
+      return;
+    }
+
+    if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.user.id !== ALLOWED_USER_ID) {
+      return interaction.reply({ content: '❌ 이 명령어를 사용할 권한이 없습니다.', ephemeral: true });
+    }
+
     if (interaction.commandName === '인증창') await 인증창Execute(interaction);
     else if (interaction.commandName === '복구키생성') await 복구키생성Execute(interaction);
     else if (interaction.commandName === '복구키사용') await 복구키사용Execute(interaction);
     else if (interaction.commandName === '인증수') await 인증수Execute(interaction);
+
   } catch (err) {
-    console.error('[Bot] Command error:', err);
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: '❌ 오류가 발생했습니다.', ephemeral: true });
-    }
+    console.error('[Bot] Interaction error:', err);
+    try {
+      if (interaction.deferred) {
+        await interaction.editReply({ content: '❌ 처리 중 오류가 발생했습니다.' });
+      } else if (!interaction.replied) {
+        await interaction.reply({ content: '❌ 오류가 발생했습니다.', ephemeral: true });
+      }
+    } catch (_) {}
   }
 });
 

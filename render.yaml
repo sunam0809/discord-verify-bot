@@ -1,23 +1,30 @@
 services:
-    - type: web
-      name: discord-verify-bot
-      runtime: node
-      buildCommand: npm install
-      startCommand: node src/index.js
-      healthCheckPath: /health
-      envVars:
-        - key: NODE_ENV
-          value: production
-        - key: BOT_TOKEN
-          sync: false
-        - key: CLIENT_ID
-          sync: false
-        - key: CLIENT_SECRET
-          sync: false
-        - key: DATABASE_URL
-          sync: false
-        - key: BASE_URL
-          sync: false
-        - key: SESSION_SECRET
-          generateValue: true
-  
+  - type: web
+    name: discord-verify-bot
+    runtime: node
+    buildCommand: npm install
+    startCommand: node src/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BOT_TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: CLIENT_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: BASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+
+  - type: cron
+    name: keep-alive
+    runtime: node
+    schedule: "*/5 * * * *"
+    buildCommand: echo "ready"
+    startCommand: >-
+      node -e "fetch('https://discord-verify-bot-momx.onrender.com/health').then(r=>console.log('Ping OK',r.status)).catch(e=>console.error('Ping failed',e.message))"

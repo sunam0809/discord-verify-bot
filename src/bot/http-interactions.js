@@ -217,13 +217,12 @@ export async function handleHttpInteraction(interaction, res) {
       // DB 저장 완료 → 즉시 응답 (생각중이에요 없음)
       res.json({ type: 4, data: { content: '✅ 설정이 저장되었습니다. 채널에 인증 패널을 생성 중입니다...', flags: 64 } });
 
-      // 패널 전송은 백그라운드에서 처리 (rate limit 재시도 포함)
+      // 패널 전송은 백그라운드에서 처리
       setImmediate(async () => {
         try {
           let guild = null;
           try { guild = await getGuild(guildId); } catch(gErr) { console.warn('[인증창] getGuild skipped:', gErr.response?.status, gErr.message); }
-          console.log('[인증창] sending panel to channel:', channelId);
-          await sendToChannel(channelId, {
+          const panelPayload = {
             embeds: [{
               title, description, color: 0x5865F2,
               ...(guild ? { footer: { text: guild.name, icon_url: guildIcon(guildId, guild.icon) } } : {}),
@@ -233,7 +232,15 @@ export async function handleHttpInteraction(interaction, res) {
               type: 1,
               components: [{ type: 2, style: 1, label: '인증하기', custom_id: `verify_${guildId}`, emoji: { name: '🛡️' } }]
             }]
-          });
+          };
+          if (webhook) {
+            // 웹훅 URL 사용 — BOT_TOKEN rate limit 우회
+            console.log('[인증창] sending panel via webhook');
+            await withRetry(() => axios.post(webhook, panelPayload, { timeout: 8000 }));
+          } else {
+            console.log('[인증창] sending panel to channel:', channelId);
+            await sendToChannel(channelId, panelPayload);
+          }
           console.log('[인증창] Panel sent successfully');
         } catch(err) {
           console.error('[인증창] Panel send failed:', err.message, err.response?.data);

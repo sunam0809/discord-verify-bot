@@ -8,7 +8,7 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 let lastBotError = null;
 let loginAttempts = 0;
-let cmdRegStatus = 'pending';
+let retryDelay = 15000; // 지수 백오프 시작값
 
 process.on('uncaughtException', (err) => {
   console.error('[Process] Uncaught exception:', err.message);
@@ -24,29 +24,8 @@ app.get('/bot-status', (req, res) => {
     uptime: client.uptime,
     loginAttempts,
     lastError: lastBotError,
-    commandsStatus: cmdRegStatus
+    nextRetryDelay: retryDelay
   });
-});
-
-// Discord API 연결 테스트 (토큰 유효성 + 네트워크 체크)
-app.get('/discord-test', async (req, res) => {
-  const results = {};
-  try {
-    const gw = await axios.get('https://discord.com/api/v10/gateway', { timeout: 10000 });
-    results.gateway = { ok: true, url: gw.data.url };
-  } catch (e) {
-    results.gateway = { ok: false, error: e.message };
-  }
-  try {
-    const me = await axios.get('https://discord.com/api/v10/users/@me', {
-      headers: { Authorization: `Bot ${process.env.BOT_TOKEN}` },
-      timeout: 10000
-    });
-    results.botToken = { ok: true, id: me.data.id, username: me.data.username };
-  } catch (e) {
-    results.botToken = { ok: false, status: e.response?.status, error: e.message };
-  }
-  res.json(results);
 });
 
 async function selfPing() {
@@ -59,15 +38,19 @@ async function selfPing() {
 
 async function startBotSafe() {
   loginAttempts++;
-  console.log(`[Bot] Login attempt #${loginAttempts}...`);
+  console.log(`[Bot] Login attempt #${loginAttempts} (delay was ${retryDelay}ms)...`);
   try {
     await startBot();
     lastBotError = null;
+    retryDelay = 15000; // 성공 시 리셋
     console.log('[Bot] ✓ Connected as', client.user?.tag);
   } catch (err) {
     lastBotError = err.message;
-    console.error(`[Bot] Login failed (attempt ${loginAttempts}): ${err.message}`);
-    setTimeout(startBotSafe, 30000);
+    console.error(`[Bot] Login failed: ${err.message}`);
+    // 지수 백오프: 15s → 30s → 60s → 120s → 최대 300s
+    retryDelay = Math.min(retryDelay * 2, 300000);
+    console.log(`[Bot] Retrying in ${retryDelay / 1000}s...`);
+    setTimeout(startBotSafe, retryDelay);
   }
 }
 
@@ -80,14 +63,22 @@ async function main() {
     console.log(`[Web] Running on port ${PORT}`);
   });
 
-  startBotSafe();
+  // registerCommands는 REGISTER_COMMANDS=true 일 때만 실행 (Rate Limit 방지)
+  // 명령어는 한 번만 등록하면 Discord에 영구 저장됨
+  if (process.env.REGISTER_COMMANDS === 'true') {
+    registerCommands()
+      .then(() => console.log('[Bot] Commands registered ✓'))
+      .catch(err => console.error('[Bot] registerCommands failed:', err.message));
+  } else {
+    console.log('[Bot] Skipping registerCommands (already registered)');
+  }
 
-  registerCommands()
-    .then(() => { cmdRegStatus = 'ok'; console.log('[Bot] Commands registered ✓'); })
-    .catch(err => { cmdRegStatus = `error: ${err.message}`; console.error('[Bot] registerCommands failed:', err.message); });
+  // 봇 연결 (30초 후 시작 - Rate Limit 429 회복 대기)
+  console.log('[Bot] Waiting 30s before connecting (Discord rate limit recovery)...');
+  setTimeout(startBotSafe, 30000);
 
   client.on('shardDisconnect', (event) => {
-    console.warn(`[Bot] Disconnected (code ${event.code})`);
+    console.warn(`[Bot] Disconnected (code ${event.code}), will auto-reconnect...`);
   });
   client.on('error', (err) => {
     console.error('[Bot] Error:', err.message);
@@ -95,6 +86,7 @@ async function main() {
 
   setInterval(selfPing, 60 * 1000);
   setTimeout(selfPing, 5000);
+  console.log(`[Ping] Self-ping every 1min → ${BASE_URL}/health`);
 }
 
 main().catch(err => {

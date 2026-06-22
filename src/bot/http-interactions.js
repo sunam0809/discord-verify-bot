@@ -192,43 +192,53 @@ export async function handleHttpInteraction(interaction, res) {
       }
     }
 
-    // ─── 인증창 (defer 필요) ───
+    // ─── 인증창 (즉시 응답 + 백그라운드 패널 전송) ───
     if (name === '인증창') {
-      res.json({ type: 5, data: { flags: 64 } });
+      const roleId = interaction.data.options?.find(o => o.name === '역할')?.value;
+      const webhook = getOption(interaction, '웹훅');
+      const title = getOption(interaction, '제목') || '✅ 서버 인증';
+      const description = getOption(interaction, '설명') || '아래 버튼을 눌러 인증을 진행해주세요.\n인증 완료 후 서버 이용이 가능합니다.';
+      const channelId = interaction.channel_id;
+      console.log('[인증창] guildId:', guildId, 'roleId:', roleId, 'channelId:', channelId);
+
       try {
-        const roleId = interaction.data.options?.find(o => o.name === '역할')?.value;
-        const webhook = getOption(interaction, '웹훅');
-        const title = getOption(interaction, '제목') || '✅ 서버 인증';
-        const description = getOption(interaction, '설명') || '아래 버튼을 눌러 인증을 진행해주세요.\n인증 완료 후 서버 이용이 가능합니다.';
-        const channelId = interaction.channel_id;
-        console.log('[인증창] guildId:', guildId, 'roleId:', roleId, 'channelId:', channelId);
         await query(
           `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
            VALUES ($1,$2,$3,$4,$5,$6)
            ON CONFLICT (guild_id) DO UPDATE SET role_id=$2, webhook_url=$3, panel_title=$4, panel_description=$5, channel_id=$6`,
           [guildId, roleId, webhook, title, description, channelId]
         );
-        console.log('[인증창] DB saved, fetching guild...');
-        let guild = null;
-        try { guild = await getGuild(guildId); } catch(gErr) { console.warn('[인증창] getGuild skipped:', gErr.response?.status, gErr.message); }
-        console.log('[인증창] Guild:', guild?.name || '(rate limited)', 'sending panel to channel:', channelId);
-        await sendToChannel(channelId, {
-          embeds: [{
-            title, description, color: 0x5865F2,
-            ...(guild ? { footer: { text: guild.name, icon_url: guildIcon(guildId, guild.icon) } } : {}),
-            timestamp: new Date().toISOString()
-          }],
-          components: [{
-            type: 1,
-            components: [{ type: 2, style: 1, label: '인증하기', custom_id: `verify_${guildId}`, emoji: { name: '🛡️' } }]
-          }]
-        });
-        console.log('[인증창] Panel sent, calling editReply...');
-        await editReply(token, { content: '✅ 인증 패널이 생성되었습니다.' });
+        console.log('[인증창] DB saved');
       } catch(err) {
-        console.error('[인증창] Error:', err.message, err.response?.data);
-        await editReply(token, { content: `❌ 오류가 발생했습니다: ${err.message}` });
+        console.error('[인증창] DB error:', err.message);
+        return res.json({ type: 4, data: { content: `❌ 설정 저장 실패: ${err.message}`, flags: 64 } });
       }
+
+      // DB 저장 완료 → 즉시 응답 (생각중이에요 없음)
+      res.json({ type: 4, data: { content: '✅ 설정이 저장되었습니다. 채널에 인증 패널을 생성 중입니다...', flags: 64 } });
+
+      // 패널 전송은 백그라운드에서 처리 (rate limit 재시도 포함)
+      setImmediate(async () => {
+        try {
+          let guild = null;
+          try { guild = await getGuild(guildId); } catch(gErr) { console.warn('[인증창] getGuild skipped:', gErr.response?.status, gErr.message); }
+          console.log('[인증창] sending panel to channel:', channelId);
+          await sendToChannel(channelId, {
+            embeds: [{
+              title, description, color: 0x5865F2,
+              ...(guild ? { footer: { text: guild.name, icon_url: guildIcon(guildId, guild.icon) } } : {}),
+              timestamp: new Date().toISOString()
+            }],
+            components: [{
+              type: 1,
+              components: [{ type: 2, style: 1, label: '인증하기', custom_id: `verify_${guildId}`, emoji: { name: '🛡️' } }]
+            }]
+          });
+          console.log('[인증창] Panel sent successfully');
+        } catch(err) {
+          console.error('[인증창] Panel send failed:', err.message, err.response?.data);
+        }
+      });
       return;
     }
 

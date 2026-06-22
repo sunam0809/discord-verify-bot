@@ -7,16 +7,32 @@ const APP_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const BASE_URL = process.env.BASE_URL;
 
-// editReply는 절대 throw 하지 않음 — 로그만 남김
+async function withRetry(fn, maxAttempts = 4) {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      return await fn();
+    } catch(e) {
+      if (e.response?.status === 429 && i < maxAttempts - 1) {
+        const retryAfter = parseFloat(e.response.headers?.['retry-after'] || '2');
+        const wait = Math.min(retryAfter * 1000 + 500, 12000);
+        console.warn(`[Retry] 429 rate limit, waiting ${wait}ms (attempt ${i + 1}/${maxAttempts})`);
+        await new Promise(r => setTimeout(r, wait));
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
 async function editReply(token, content) {
   const payload = typeof content === 'string' ? { content } : content;
   try {
-    const res = await axios.patch(
+    await withRetry(() => axios.patch(
       `https://discord.com/api/v10/webhooks/${APP_ID}/${token}/messages/@original`,
       payload,
       { headers: { 'Content-Type': 'application/json' }, timeout: 8000 }
-    );
-    console.log('[editReply] OK status:', res.status);
+    ));
+    console.log('[editReply] OK');
   } catch(e) {
     console.error('[editReply] FAILED:', e.response?.status, JSON.stringify(e.response?.data), e.message);
   }
@@ -27,29 +43,29 @@ function getOption(interaction, name) {
 }
 
 async function sendToChannel(channelId, payload) {
-  const res = await axios.post(
+  const res = await withRetry(() => axios.post(
     `https://discord.com/api/v10/channels/${channelId}/messages`,
     payload,
     { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
-  );
+  ));
   return res.data;
 }
 
 async function addRole(guildId, userId, roleId) {
-  await axios.put(
+  await withRetry(() => axios.put(
     `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${roleId}`,
     {},
     { headers: { Authorization: `Bot ${BOT_TOKEN}` }, timeout: 8000 }
-  ).catch(e => console.error('[addRole]', e.response?.status, e.message));
+  )).catch(e => console.error('[addRole]', e.response?.status, e.message));
 }
 
 async function addMemberToGuild(guildId, userId, accessToken, roleId) {
   try {
-    const res = await axios.put(
+    const res = await withRetry(() => axios.put(
       `https://discord.com/api/v10/guilds/${guildId}/members/${userId}`,
       { access_token: accessToken, roles: roleId ? [roleId] : [] },
       { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
-    );
+    ));
     return { ok: true, alreadyIn: res.status === 204 };
   } catch(e) {
     return { ok: false, status: e.response?.status };
@@ -67,10 +83,10 @@ async function refreshAccessToken(refreshToken) {
 }
 
 async function getGuild(guildId) {
-  const res = await axios.get(
+  const res = await withRetry(() => axios.get(
     `https://discord.com/api/v10/guilds/${guildId}`,
     { headers: { Authorization: `Bot ${BOT_TOKEN}` }, timeout: 8000 }
-  );
+  ));
   return res.data;
 }
 

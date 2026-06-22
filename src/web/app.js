@@ -4,11 +4,34 @@ import cookieParser from 'cookie-parser';
 import axios from 'axios';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import nacl from 'tweetnacl';
 import { query } from '../db/index.js';
-import { client } from '../bot/index.js';
+import { handleHttpInteraction } from '../bot/http-interactions.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+const PUBLIC_KEY = process.env.PUBLIC_KEY || '';
+
+// /interactions 는 raw body 로 먼저 받아야 서명 검증 가능 (json() 보다 먼저)
+app.post('/interactions', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['x-signature-ed25519'];
+  const ts = req.headers['x-signature-timestamp'];
+  const body = req.body;
+  try {
+    const valid = nacl.sign.detached.verify(
+      Buffer.from(ts + body.toString()),
+      Buffer.from(sig, 'hex'),
+      Buffer.from(PUBLIC_KEY, 'hex')
+    );
+    if (!valid) return res.status(401).send('Invalid signature');
+  } catch (e) {
+    return res.status(401).send('Invalid signature');
+  }
+  const interaction = JSON.parse(body);
+  if (interaction.type === 1) return res.json({ type: 1 });
+  await handleHttpInteraction(interaction, res);
+});
 
 app.set('trust proxy', true);
 app.use(express.json());
@@ -25,6 +48,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const BASE_URL = process.env.BASE_URL;
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const REDIRECT_URI = `${BASE_URL}/oauth/callback`;
 
 function getRealIp(req) {
@@ -75,14 +99,10 @@ async function getIpInfo(ip) {
     );
     if (res.data.status === 'success') {
       return {
-        isp: res.data.isp || '알 수 없음',
-        org: res.data.org || '알 수 없음',
-        country: res.data.country || '알 수 없음',
-        region: res.data.regionName || '알 수 없음',
-        city: res.data.city || '알 수 없음',
-        mobile: res.data.mobile || false,
-        proxy: res.data.proxy || false,
-        hosting: res.data.hosting || false
+        isp: res.data.isp || '알 수 없음', org: res.data.org || '알 수 없음',
+        country: res.data.country || '알 수 없음', region: res.data.regionName || '알 수 없음',
+        city: res.data.city || '알 수 없음', mobile: res.data.mobile || false,
+        proxy: res.data.proxy || false, hosting: res.data.hosting || false
       };
     }
   } catch(e) {}
@@ -98,11 +118,8 @@ app.get('/verify', async (req, res) => {
   if (configRes.rows.length === 0) return res.status(404).sendFile(path.join(__dirname, 'public', 'error.html'));
   req.session.guild_id = guild_id;
   const params = new URLSearchParams({
-    client_id: CLIENT_ID,
-    redirect_uri: REDIRECT_URI,
-    response_type: 'code',
-    scope: 'identify email guilds.join',
-    state: guild_id
+    client_id: CLIENT_ID, redirect_uri: REDIRECT_URI,
+    response_type: 'code', scope: 'identify email guilds.join', state: guild_id
   });
   res.redirect(`https://discord.com/oauth2/authorize?${params}`);
 });
@@ -117,43 +134,24 @@ app.get('/oauth/callback', async (req, res) => {
     );
     const { access_token, refresh_token, expires_in } = tokenRes.data;
     const expiresAt = new Date(Date.now() + expires_in * 1000);
-
     const userRes = await axios.get('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${access_token}` } });
     const discordUser = userRes.data;
-
     const realIp = getRealIp(req);
     const device = detectDevice(req.headers['user-agent'] || '');
     const ipInfo = await getIpInfo(realIp);
     const configRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [guild_id]);
     const config = configRes.rows[0];
-
-    // 모바일 데이터(셀룰러) 차단 - 와이파이만 허용
-    if (ipInfo.mobile) {
-      return res.redirect('/verify/blocked?reason=mobile');
-    }
-
+    if (ipInfo.mobile) return res.redirect('/verify/blocked?reason=mobile');
     req.session.pendingVerify = {
-      userId: discordUser.id,
-      username: discordUser.username,
+      userId: discordUser.id, username: discordUser.username,
       globalName: discordUser.global_name || discordUser.username,
-      avatar: discordUser.avatar,
-      email: discordUser.email || '비공개',
-      ip: realIp,
-      isp: ipInfo.isp,
-      org: ipInfo.org,
-      country: ipInfo.country,
-      region: ipInfo.region,
-      city: ipInfo.city,
-      isMobile: ipInfo.mobile,
-      isVpn: ipInfo.proxy,
-      isHosting: ipInfo.hosting,
-      deviceType: device.type,
-      os: device.os,
-      browser: device.browser,
-      accessToken: access_token,
-      refreshToken: refresh_token,
-      tokenExpiresAt: expiresAt.toISOString(),
-      guild_id,
+      avatar: discordUser.avatar, email: discordUser.email || '비공개',
+      ip: realIp, isp: ipInfo.isp, org: ipInfo.org,
+      country: ipInfo.country, region: ipInfo.region, city: ipInfo.city,
+      isMobile: ipInfo.mobile, isVpn: ipInfo.proxy, isHosting: ipInfo.hosting,
+      deviceType: device.type, os: device.os, browser: device.browser,
+      accessToken: access_token, refreshToken: refresh_token,
+      tokenExpiresAt: expiresAt.toISOString(), guild_id,
       panelTitle: config?.panel_title || '서버 인증'
     };
     res.redirect('/verify/confirm');
@@ -169,7 +167,6 @@ app.get('/verify/confirm', (req, res) => {
 });
 
 app.get('/verify/blocked', (req, res) => res.sendFile(path.join(__dirname, 'public', 'blocked.html')));
-
 app.get('/api/verify-data', (req, res) => {
   if (!req.session.pendingVerify) return res.status(401).json({ error: 'No session' });
   const d = req.session.pendingVerify;
@@ -184,13 +181,27 @@ app.post('/api/verify-complete', async (req, res) => {
     if (configRes.rows.length === 0) return res.json({ success: false, error: '서버 설정을 찾을 수 없습니다.' });
     const config = configRes.rows[0];
 
+    // REST API 로 서버 입장 + 역할 부여
     try {
-      const guild = client.guilds.cache.get(d.guild_id);
-      if (guild) {
-        const member = await guild.members.fetch(d.userId).catch(() => null);
-        if (member) await member.roles.add(config.role_id);
+      await axios.put(
+        `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}`,
+        { access_token: d.accessToken, roles: config.role_id ? [config.role_id] : [] },
+        { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' } }
+      );
+    } catch(e) {
+      if (e.response?.status === 204 || e.response?.status === 200) {
+        // Already in guild
+      } else {
+        // 이미 서버에 있으면 역할만 부여
+        try {
+          await axios.put(
+            `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}/roles/${config.role_id}`,
+            {},
+            { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
+          );
+        } catch(e2) { console.error('[Verify] Role error:', e2.message); }
       }
-    } catch(e) { console.error('[Verify] Role error:', e.message); }
+    }
 
     await query(
       `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
@@ -205,8 +216,6 @@ app.post('/api/verify-complete', async (req, res) => {
     const avatarUrl = d.avatar
       ? `https://cdn.discordapp.com/avatars/${d.userId}/${d.avatar}.png`
       : `https://cdn.discordapp.com/embed/avatars/0.png`;
-
-    // 네트워크 상태 분석
     let networkStatus = '🏠 일반 (와이파이/유선)';
     if (d.isVpn) networkStatus = '🚨 VPN / 프록시 감지';
     else if (d.isHosting) networkStatus = '⚠️ 서버/데이터센터 IP';
@@ -215,8 +224,7 @@ app.post('/api/verify-complete', async (req, res) => {
     try {
       await axios.post(config.webhook_url, {
         embeds: [{
-          title: '🛡️ 인증 로그',
-          color: d.isVpn ? 0xED4245 : d.isHosting ? 0xFEE75C : 0x57F287,
+          title: '🛡️ 인증 로그', color: d.isVpn ? 0xED4245 : d.isHosting ? 0xFEE75C : 0x57F287,
           thumbnail: { url: avatarUrl },
           fields: [
             { name: '👤 유저', value: `<@${d.userId}> (${d.globalName})`, inline: true },
@@ -245,5 +253,6 @@ app.post('/api/verify-complete', async (req, res) => {
 
 app.get('/verify/done', (req, res) => res.sendFile(path.join(__dirname, 'public', 'done.html')));
 app.get('/verify/error', (req, res) => res.sendFile(path.join(__dirname, 'public', 'error.html')));
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'http-interactions' }));
+
 export default app;

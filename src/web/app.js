@@ -88,24 +88,59 @@ function detectDevice(ua) {
   return { type, os, browser };
 }
 
+// ─── IP 정보 캐시 (ip-api.com rate limit 방지: 5분 TTL) ─────────────────────
+const ipCache = new Map();
+const IP_CACHE_TTL = 5 * 60 * 1000;
+
 async function getIpInfo(ip) {
   const def = { isp: '알 수 없음', org: '알 수 없음', country: '알 수 없음', region: '알 수 없음', city: '알 수 없음', mobile: false, proxy: false, hosting: false };
   if (!ip || isPrivateIp(ip)) return def;
+
+  // 캐시 확인 (같은 IP는 5분간 재조회 없음)
+  const cached = ipCache.get(ip);
+  if (cached && Date.now() < cached.expires) return cached.data;
+
   try {
     const res = await axios.get(
       `http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,mobile,proxy,hosting&lang=ko`,
       { timeout: 4000 }
     );
     if (res.data.status === 'success') {
-      return {
+      const data = {
         isp: res.data.isp || '알 수 없음', org: res.data.org || '알 수 없음',
         country: res.data.country || '알 수 없음', region: res.data.regionName || '알 수 없음',
         city: res.data.city || '알 수 없음', mobile: res.data.mobile || false,
         proxy: res.data.proxy || false, hosting: res.data.hosting || false
       };
+      ipCache.set(ip, { data, expires: Date.now() + IP_CACHE_TTL });
+      return data;
     }
-  } catch(e) {}
+  } catch(e) {
+    // 429(rate limit) 또는 네트워크 오류 시 기본값 반환
+    console.warn('[IpInfo] 조회 실패 (기본값 사용):', e.response?.status || e.message);
+  }
   return def;
+}
+
+// ─── Discord API 429 재시도 래퍼 ────────────────────────────────────────────
+async function discordRequest(fn, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const status = e.response?.status;
+      if (status === 429 && i < maxRetries - 1) {
+        const retryAfter = parseFloat(
+          e.response.headers?.['retry-after'] || e.response.data?.retry_after || '2'
+        );
+        const wait = Math.min(retryAfter * 1000 + 300, 8000);
+        console.warn(`[Discord] 429 rate limit, ${wait}ms 후 재시도 (${i + 1}/${maxRetries})`);
+        await new Promise(r => setTimeout(r, wait));
+      } else {
+        throw e;
+      }
+    }
+  }
 }
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
@@ -127,14 +162,22 @@ app.get('/oauth/callback', async (req, res) => {
   const { code, state: guild_id } = req.query;
   if (!code) return res.redirect('/verify/error?msg=' + encodeURIComponent('인증 코드가 없습니다.'));
   try {
-    const tokenRes = await axios.post('https://discord.com/api/oauth2/token',
+    // Discord 토큰 교환 (429 발생 시 재시도)
+    const tokenRes = await discordRequest(() => axios.post(
+      'https://discord.com/api/oauth2/token',
       new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
+    ));
     const { access_token, refresh_token, expires_in } = tokenRes.data;
     const expiresAt = new Date(Date.now() + expires_in * 1000);
-    const userRes = await axios.get('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${access_token}` } });
+
+    // Discord 유저 정보 조회 (429 발생 시 재시도)
+    const userRes = await discordRequest(() => axios.get(
+      'https://discord.com/api/users/@me',
+      { headers: { Authorization: `Bearer ${access_token}` } }
+    ));
     const discordUser = userRes.data;
+
     const realIp = getRealIp(req);
     const device = detectDevice(req.headers['user-agent'] || '');
     const ipInfo = await getIpInfo(realIp);
@@ -156,9 +199,18 @@ app.get('/oauth/callback', async (req, res) => {
     };
     res.redirect('/verify/confirm');
   } catch (err) {
+    const status = err.response?.status;
     const oauthErr = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-    console.error('[OAuth] Error:', oauthErr);
-    res.redirect('/verify/error?msg=' + encodeURIComponent('인증 처리 중 오류가 발생했습니다. (' + (err.response?.data?.error_description || err.response?.data?.error || err.message) + ')'));
+    console.error('[OAuth] Error:', status, oauthErr);
+
+    let userMsg;
+    if (status === 429) {
+      const retryAfter = err.response?.data?.retry_after || err.response?.headers?.['retry-after'] || 30;
+      userMsg = `요청이 너무 많습니다. ${Math.ceil(retryAfter)}초 후 다시 시도해 주세요.`;
+    } else {
+      userMsg = '인증 처리 중 오류가 발생했습니다. (' + (err.response?.data?.error_description || err.response?.data?.error || err.message) + ')';
+    }
+    res.redirect('/verify/error?msg=' + encodeURIComponent(userMsg));
   }
 });
 
@@ -213,7 +265,6 @@ app.post('/api/verify-complete', async (req, res) => {
        d.country, d.region, d.city, d.accessToken, d.refreshToken, d.tokenExpiresAt]
     );
 
-    // 웹훅이 설정된 경우에만 로그 전송
     if (config.webhook_url) {
       const avatarUrl = d.avatar
         ? `https://cdn.discordapp.com/avatars/${d.userId}/${d.avatar}.png`

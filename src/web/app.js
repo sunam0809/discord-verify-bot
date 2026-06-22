@@ -96,7 +96,6 @@ async function getIpInfo(ip) {
   const def = { isp: '알 수 없음', org: '알 수 없음', country: '알 수 없음', region: '알 수 없음', city: '알 수 없음', mobile: false, proxy: false, hosting: false };
   if (!ip || isPrivateIp(ip)) return def;
 
-  // 캐시 확인 (같은 IP는 5분간 재조회 없음)
   const cached = ipCache.get(ip);
   if (cached && Date.now() < cached.expires) return cached.data;
 
@@ -116,14 +115,14 @@ async function getIpInfo(ip) {
       return data;
     }
   } catch(e) {
-    // 429(rate limit) 또는 네트워크 오류 시 기본값 반환
     console.warn('[IpInfo] 조회 실패 (기본값 사용):', e.response?.status || e.message);
   }
   return def;
 }
 
-// ─── Discord API 429 재시도 래퍼 ────────────────────────────────────────────
-async function discordRequest(fn, maxRetries = 3) {
+// ─── Discord API 재시도 래퍼 ────────────────────────────────────────────────
+// retry_after가 10초 초과면 재시도 의미 없으므로 즉시 에러 전파
+async function discordRequest(fn, maxRetries = 2) {
   for (let i = 0; i < maxRetries; i++) {
     try {
       return await fn();
@@ -131,10 +130,14 @@ async function discordRequest(fn, maxRetries = 3) {
       const status = e.response?.status;
       if (status === 429 && i < maxRetries - 1) {
         const retryAfter = parseFloat(
-          e.response.headers?.['retry-after'] || e.response.data?.retry_after || '2'
+          e.response.headers?.['retry-after'] || e.response.data?.retry_after || '60'
         );
-        const wait = Math.min(retryAfter * 1000 + 300, 8000);
-        console.warn(`[Discord] 429 rate limit, ${wait}ms 후 재시도 (${i + 1}/${maxRetries})`);
+        if (retryAfter > 10) {
+          console.warn(`[Discord] 429 장기 rate limit (${retryAfter}s) — 재시도 포기`);
+          throw e;
+        }
+        const wait = retryAfter * 1000 + 300;
+        console.warn(`[Discord] 429, ${wait}ms 후 재시도 (${i + 1}/${maxRetries})`);
         await new Promise(r => setTimeout(r, wait));
       } else {
         throw e;
@@ -162,7 +165,6 @@ app.get('/oauth/callback', async (req, res) => {
   const { code, state: guild_id } = req.query;
   if (!code) return res.redirect('/verify/error?msg=' + encodeURIComponent('인증 코드가 없습니다.'));
   try {
-    // Discord 토큰 교환 (429 발생 시 재시도)
     const tokenRes = await discordRequest(() => axios.post(
       'https://discord.com/api/oauth2/token',
       new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI }),
@@ -170,14 +172,11 @@ app.get('/oauth/callback', async (req, res) => {
     ));
     const { access_token, refresh_token, expires_in } = tokenRes.data;
     const expiresAt = new Date(Date.now() + expires_in * 1000);
-
-    // Discord 유저 정보 조회 (429 발생 시 재시도)
     const userRes = await discordRequest(() => axios.get(
       'https://discord.com/api/users/@me',
       { headers: { Authorization: `Bearer ${access_token}` } }
     ));
     const discordUser = userRes.data;
-
     const realIp = getRealIp(req);
     const device = detectDevice(req.headers['user-agent'] || '');
     const ipInfo = await getIpInfo(realIp);
@@ -200,13 +199,13 @@ app.get('/oauth/callback', async (req, res) => {
     res.redirect('/verify/confirm');
   } catch (err) {
     const status = err.response?.status;
-    const oauthErr = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-    console.error('[OAuth] Error:', status, oauthErr);
+    const retryAfter = parseFloat(err.response?.data?.retry_after || err.response?.headers?.['retry-after'] || 0);
+    console.error('[OAuth] Error:', status, err.response?.data || err.message, 'retry_after:', retryAfter);
 
     let userMsg;
     if (status === 429) {
-      const retryAfter = err.response?.data?.retry_after || err.response?.headers?.['retry-after'] || 30;
-      userMsg = `요청이 너무 많습니다. ${Math.ceil(retryAfter)}초 후 다시 시도해 주세요.`;
+      // retry_after 값은 절대 그대로 노출하지 않음
+      userMsg = 'Discord 서버 응답 제한으로 인해 잠시 인증이 불가합니다. 몇 분 후 다시 시도해 주세요.';
     } else {
       userMsg = '인증 처리 중 오류가 발생했습니다. (' + (err.response?.data?.error_description || err.response?.data?.error || err.message) + ')';
     }
@@ -243,7 +242,7 @@ app.post('/api/verify-complete', async (req, res) => {
       );
     } catch(e) {
       if (e.response?.status === 204 || e.response?.status === 200) {
-        // Already in guild — do nothing
+        // Already in guild
       } else {
         try {
           await axios.put(

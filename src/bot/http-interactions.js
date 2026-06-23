@@ -250,18 +250,27 @@ export async function handleHttpInteraction(interaction, res) {
         for (const user of users) {
           let tok = user.access_token;
           let ref = user.refresh_token;
-          const isExpired = user.token_expires_at && new Date(user.token_expires_at) < new Date();
-          console.log('[복구키사용] processing user:', user.user_id, 'expired:', isExpired);
-          if (isExpired && ref) {
-            const refreshed = await refreshAccessToken(ref);
+          let refreshed = null;
+
+          // token_expires_at 유무·만료 여부 무관하게 항상 갱신 시도
+          // (NULL이어도 실제 토큰이 만료됐을 수 있음)
+          if (ref) {
+            refreshed = await refreshAccessToken(ref);
             if (refreshed) {
-              tok = refreshed.access_token; ref = refreshed.refresh_token;
+              tok = refreshed.access_token;
+              ref = refreshed.refresh_token;
+              const newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
               await query(
                 'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
-                [tok, ref, new Date(Date.now() + refreshed.expires_in * 1000).toISOString(), user.id]
-              );
-            } else { tokenFailed++; continue; }
+                [tok, ref, newExpiry, user.id]
+              ).catch(e => console.error('[복구키사용] token update error:', e.message));
+              console.log('[복구키사용] token refreshed for user:', user.user_id);
+            } else {
+              // 갱신 실패 → continue 없이 기존 토큰으로 초대 시도
+              console.warn('[복구키사용] refresh failed for user:', user.user_id, '— retrying with existing token');
+            }
           }
+
           const result = await addMemberToGuild(guildId, user.user_id, tok, config.role_id);
           if (result.ok) {
             if (result.alreadyIn) { await addRole(guildId, user.user_id, config.role_id); alreadyIn++; }
@@ -270,11 +279,14 @@ export async function handleHttpInteraction(interaction, res) {
               `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (user_id, guild_id) DO NOTHING`,
               [user.user_id, guildId, user.username, user.email, user.ip, user.isp,
-               user.carrier, user.country, user.region, user.city, tok, ref, user.token_expires_at]
+               user.carrier, user.country, user.region, user.city, tok, ref,
+               refreshed ? new Date(Date.now() + refreshed.expires_in * 1000).toISOString() : user.token_expires_at]
             );
           } else {
-            console.error('[복구키사용] invite FAILED for user:', user.user_id, 'status:', result.status);
-            failed++;
+            console.error('[복구키사용] invite FAILED user:', user.user_id, 'status:', result.status, 'refreshed:', !!refreshed);
+            // 갱신도 실패하고 초대도 실패한 경우만 tokenFailed, 나머지는 failed
+            if (!refreshed && ref) tokenFailed++;
+            else failed++;
           }
           await new Promise(r => setTimeout(r, 600));
         }
@@ -287,10 +299,10 @@ export async function handleHttpInteraction(interaction, res) {
               { name: '총 대상', value: `${users.length}명`, inline: true },
               { name: '새로 초대됨', value: `${invited}명`, inline: true },
               { name: '이미 있음(역할 부여)', value: `${alreadyIn}명`, inline: true },
-              { name: '토큰 만료', value: `${tokenFailed}명`, inline: true },
+              { name: '토큰 만료(재인증 필요)', value: `${tokenFailed}명`, inline: true },
               { name: '초대 실패', value: `${failed}명`, inline: true }
             ],
-            footer: { text: '토큰 만료 유저는 재인증 필요' }
+            footer: { text: '토큰 만료 유저는 재인증 후 다시 초대됩니다.' }
           }]
         });
       } catch(err) {

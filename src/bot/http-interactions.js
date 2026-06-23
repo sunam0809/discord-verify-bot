@@ -13,9 +13,7 @@ async function withRetry(fn, maxAttempts = 6) {
       return await fn();
     } catch(e) {
       if (e.response?.status === 429 && i < maxAttempts - 1) {
-        const retryAfter = parseFloat(
-          e.response.headers?.['retry-after'] || e.response.data?.retry_after || '5'
-        );
+        const retryAfter = parseFloat(e.response.headers?.['retry-after'] || e.response.data?.retry_after || '5');
         const wait = Math.min(retryAfter * 1000 + 500, 15000);
         console.warn(`[Retry] 429, waiting ${wait}ms (attempt ${i+1}/${maxAttempts})`);
         await new Promise(r => setTimeout(r, wait));
@@ -49,16 +47,19 @@ async function addRole(guildId, userId, roleId) {
       { headers: { Authorization: `Bot ${BOT_TOKEN}` }, timeout: 8000 }
     ));
     console.log('[addRole] OK guild:', guildId, 'user:', userId, 'role:', roleId);
+    return true;
   } catch(e) {
     console.error('[addRole] FAILED:', e.response?.status, e.response?.data?.message || e.message, 'guild:', guildId, 'user:', userId, 'role:', roleId);
+    return false;
   }
 }
 
-async function addMemberToGuild(guildId, userId, accessToken, roleId) {
+// roles 없이 멤버만 추가 — roles 포함 시 봇 역할 위치 제약으로 403 발생 가능
+async function addMemberToGuild(guildId, userId, accessToken) {
   try {
     const res = await withRetry(() => axios.put(
       `https://discord.com/api/v10/guilds/${guildId}/members/${userId}`,
-      { access_token: accessToken, roles: roleId ? [roleId] : [] },
+      { access_token: accessToken },
       { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
     ));
     console.log('[addMember] status:', res.status, 'guild:', guildId, 'user:', userId);
@@ -182,7 +183,6 @@ export async function handleHttpInteraction(interaction, res) {
       const description = getOption(interaction, '설명') || '아래 버튼을 눌러 인증을 진행해주세요.\n인증 완료 후 서버 이용이 가능합니다.';
       const channelId = interaction.channel_id;
       console.log('[인증창] guildId:', guildId, 'roleId:', roleId, 'webhook:', webhook ? 'yes' : 'no');
-
       try {
         await query(
           `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
@@ -191,28 +191,17 @@ export async function handleHttpInteraction(interaction, res) {
            SET role_id=$2, webhook_url=$3, panel_title=$4, panel_description=$5, channel_id=$6`,
           [guildId, roleId, webhook, title, description, channelId]
         );
-        console.log('[인증창] DB saved, sending panel as initial response');
       } catch(err) {
         console.error('[인증창] DB error:', err.message);
         return res.json({ type: 4, data: { content: `❌ 설정 저장 실패: ${err.message}`, flags: 64 } });
       }
-
       return res.json({
         type: 4,
         data: {
-          embeds: [{
-            title,
-            description,
-            color: 0x5865F2,
-            timestamp: new Date().toISOString()
-          }],
+          embeds: [{ title, description, color: 0x5865F2, timestamp: new Date().toISOString() }],
           components: [{
             type: 1,
-            components: [{
-              type: 2, style: 1, label: '인증하기',
-              custom_id: `verify_${guildId}`,
-              emoji: { name: '🛡️' }
-            }]
+            components: [{ type: 2, style: 1, label: '인증하기', custom_id: `verify_${guildId}`, emoji: { name: '🛡️' } }]
           }]
         }
       });
@@ -240,41 +229,51 @@ export async function handleHttpInteraction(interaction, res) {
           [keyData.source_guild_id]
         );
         const users = usersRes.rows;
-        console.log('[복구키사용] sourceGuild:', keyData.source_guild_id, 'users found:', users.length, 'targetRole:', config.role_id);
+        console.log('[복구키사용] sourceGuild:', keyData.source_guild_id, 'users:', users.length, 'targetRole:', config.role_id);
         if (users.length === 0) { await editReply(token, '❌ 초대할 인증 유저가 없습니다.'); return; }
 
         await query('UPDATE recovery_keys SET used=TRUE WHERE id=$1', [keyData.id]);
         await editReply(token, `⏳ ${users.length}명 초대 중...`);
 
         let invited = 0, alreadyIn = 0, failed = 0, tokenFailed = 0;
+
         for (const user of users) {
           let tok = user.access_token;
           let ref = user.refresh_token;
           let refreshed = null;
 
-          // token_expires_at 유무·만료 여부 무관하게 항상 갱신 시도
-          // (NULL이어도 실제 토큰이 만료됐을 수 있음)
+          // 항상 토큰 갱신 시도 (token_expires_at NULL이어도 만료됐을 수 있음)
           if (ref) {
             refreshed = await refreshAccessToken(ref);
             if (refreshed) {
               tok = refreshed.access_token;
               ref = refreshed.refresh_token;
-              const newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
               await query(
                 'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
-                [tok, ref, newExpiry, user.id]
+                [tok, ref, new Date(Date.now() + refreshed.expires_in * 1000).toISOString(), user.id]
               ).catch(e => console.error('[복구키사용] token update error:', e.message));
               console.log('[복구키사용] token refreshed for user:', user.user_id);
             } else {
-              // 갱신 실패 → continue 없이 기존 토큰으로 초대 시도
-              console.warn('[복구키사용] refresh failed for user:', user.user_id, '— retrying with existing token');
+              console.warn('[복구키사용] refresh failed for user:', user.user_id, '— trying existing token anyway');
             }
           }
 
-          const result = await addMemberToGuild(guildId, user.user_id, tok, config.role_id);
+          // 1단계: 멤버 추가 (roles 없이 — roles 포함 시 봇 역할 위치 제약으로 403 발생)
+          const result = await addMemberToGuild(guildId, user.user_id, tok);
+
           if (result.ok) {
-            if (result.alreadyIn) { await addRole(guildId, user.user_id, config.role_id); alreadyIn++; }
-            else invited++;
+            if (result.alreadyIn) {
+              alreadyIn++;
+              console.log('[복구키사용] user already in guild:', user.user_id);
+            } else {
+              invited++;
+            }
+
+            // 2단계: 역할 별도 부여 (멤버 추가와 분리해야 403 회피 가능)
+            if (config.role_id) {
+              await addRole(guildId, user.user_id, config.role_id);
+            }
+
             await query(
               `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (user_id, guild_id) DO NOTHING`,
@@ -284,10 +283,10 @@ export async function handleHttpInteraction(interaction, res) {
             );
           } else {
             console.error('[복구키사용] invite FAILED user:', user.user_id, 'status:', result.status, 'refreshed:', !!refreshed);
-            // 갱신도 실패하고 초대도 실패한 경우만 tokenFailed, 나머지는 failed
             if (!refreshed && ref) tokenFailed++;
             else failed++;
           }
+
           await new Promise(r => setTimeout(r, 600));
         }
 
@@ -306,7 +305,7 @@ export async function handleHttpInteraction(interaction, res) {
           }]
         });
       } catch(err) {
-        console.error('[복구키사용] FATAL Error:', err.message, err.stack);
+        console.error('[복구키사용] FATAL:', err.message, err.stack);
         await editReply(token, `❌ 오류: ${err.message}`);
       }
       return;

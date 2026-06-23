@@ -50,8 +50,6 @@ const BASE_URL = process.env.BASE_URL;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const REDIRECT_URI = `${BASE_URL}/oauth/callback`;
 
-// Cloudflare Worker 프록시 URL (설정 시 Discord API를 직접 호출하지 않음)
-// Render 환경변수에 OAUTH_PROXY_URL=https://your-worker.workers.dev 추가
 const OAUTH_PROXY_URL = process.env.OAUTH_PROXY_URL || null;
 
 function getRealIp(req) {
@@ -92,7 +90,6 @@ function detectDevice(ua) {
   return { type, os, browser };
 }
 
-// ─── IP 정보 캐시 (ip-api.com rate limit 방지: 5분 TTL) ─────────────────────
 const ipCache = new Map();
 const IP_CACHE_TTL = 5 * 60 * 1000;
 
@@ -122,17 +119,12 @@ async function getIpInfo(ip) {
   return def;
 }
 
-// ─── Discord OAuth 토큰 교환 ─────────────────────────────────────────────────
-// OAUTH_PROXY_URL이 설정된 경우 Cloudflare Worker를 통해 요청 (rate limit 우회)
-// 미설정 시 Discord 직접 호출 (기존 방식)
 async function exchangeDiscordCode(params) {
   const endpoint = OAUTH_PROXY_URL || 'https://discord.com/api/oauth2/token';
   const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
-
   if (OAUTH_PROXY_URL) {
     console.log('[OAuth] Cloudflare Worker 프록시 사용:', OAUTH_PROXY_URL);
   }
-
   const res = await axios.post(endpoint, params, { headers });
   return res;
 }
@@ -156,7 +148,6 @@ app.get('/oauth/callback', async (req, res) => {
   const { code, state: guild_id } = req.query;
   if (!code) return res.redirect('/verify/error?msg=' + encodeURIComponent('인증 코드가 없습니다.'));
   try {
-    // Discord 토큰 교환 (프록시 또는 직접 호출)
     const tokenRes = await exchangeDiscordCode(new URLSearchParams({
       client_id: CLIENT_ID,
       client_secret: CLIENT_SECRET,
@@ -224,25 +215,37 @@ app.post('/api/verify-complete', async (req, res) => {
     const configRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [d.guild_id]);
     if (configRes.rows.length === 0) return res.json({ success: false, error: '서버 설정을 찾을 수 없습니다.' });
     const config = configRes.rows[0];
+
+    // Discord PUT /guilds/{id}/members/{userId} 응답:
+    //   201 Created     -> 신규 가입, body의 roles가 적용됨
+    //   204 No Content  -> 이미 서버 멤버, roles 파라미터 무시됨 -> 별도 역할 부여 필요
     try {
-      await axios.put(
+      const joinRes = await axios.put(
         `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}`,
         { access_token: d.accessToken, roles: config.role_id ? [config.role_id] : [] },
         { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' } }
       );
+      // 204 = 이미 서버에 있음 -> roles가 무시되므로 별도 역할 부여 API 호출
+      if (joinRes.status === 204 && config.role_id) {
+        await axios.put(
+          `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}/roles/${config.role_id}`,
+          {},
+          { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
+        ).catch(e2 => console.error('[Verify] Role error (already in server):', e2.response?.status, e2.message));
+      }
     } catch(e) {
-      if (e.response?.status === 204 || e.response?.status === 200) {
-        // 이미 서버에 있음
-      } else {
+      // 가입 실패시 역할만 직접 부여 시도
+      if (config.role_id) {
         try {
           await axios.put(
             `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}/roles/${config.role_id}`,
             {},
             { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
           );
-        } catch(e2) { console.error('[Verify] Role error:', e2.message); }
+        } catch(e2) { console.error('[Verify] Role error:', e2.response?.status, e2.message); }
       }
     }
+
     await query(
       `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)

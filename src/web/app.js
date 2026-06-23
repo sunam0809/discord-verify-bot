@@ -293,6 +293,6 @@ app.post('/api/verify-complete', async (req, res) => {
 
 app.get('/verify/done', (req, res) => res.sendFile(path.join(__dirname, 'public', 'done.html')));
 app.get('/verify/error', (req, res) => res.sendFile(path.join(__dirname, 'public', 'error.html')));
-app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'http-interactions' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'http-interactions', proxy: !!OAUTH_PROXY_URL }));
 
 export default app;

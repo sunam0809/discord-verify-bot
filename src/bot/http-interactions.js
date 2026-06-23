@@ -42,11 +42,16 @@ function getOption(interaction, name) {
 }
 
 async function addRole(guildId, userId, roleId) {
-  await withRetry(() => axios.put(
-    `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${roleId}`,
-    {},
-    { headers: { Authorization: `Bot ${BOT_TOKEN}` }, timeout: 8000 }
-  )).catch(e => console.error('[addRole]', e.response?.status, e.message));
+  try {
+    await withRetry(() => axios.put(
+      `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${roleId}`,
+      {},
+      { headers: { Authorization: `Bot ${BOT_TOKEN}` }, timeout: 8000 }
+    ));
+    console.log('[addRole] OK guild:', guildId, 'user:', userId, 'role:', roleId);
+  } catch(e) {
+    console.error('[addRole] FAILED:', e.response?.status, e.response?.data?.message || e.message, 'guild:', guildId, 'user:', userId, 'role:', roleId);
+  }
 }
 
 async function addMemberToGuild(guildId, userId, accessToken, roleId) {
@@ -56,8 +61,10 @@ async function addMemberToGuild(guildId, userId, accessToken, roleId) {
       { access_token: accessToken, roles: roleId ? [roleId] : [] },
       { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
     ));
+    console.log('[addMember] status:', res.status, 'guild:', guildId, 'user:', userId);
     return { ok: true, alreadyIn: res.status === 204 };
   } catch(e) {
+    console.error('[addMember] FAILED:', e.response?.status, e.response?.data?.message || e.message, 'guild:', guildId, 'user:', userId);
     return { ok: false, status: e.response?.status };
   }
 }
@@ -69,7 +76,10 @@ async function refreshAccessToken(refreshToken) {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 8000 }
     );
     return { access_token: res.data.access_token, refresh_token: res.data.refresh_token, expires_in: res.data.expires_in };
-  } catch(e) { return null; }
+  } catch(e) {
+    console.error('[refreshToken] FAILED:', e.response?.status, e.message);
+    return null;
+  }
 }
 
 const ALLOWED_USER_ID = '1368030640628301865';
@@ -81,13 +91,13 @@ export async function handleHttpInteraction(interaction, res) {
 
   console.log('[Interaction] type:', interaction.type, 'name:', interaction.data?.name, 'userId:', userId);
 
-  // ── 버튼 클릭 ──────────────────────────────────────────────
   if (interaction.type === 3) {
     const customId = interaction.data?.custom_id || '';
     if (customId.startsWith('verify_')) {
       const btnGuildId = customId.replace('verify_', '');
       const username = interaction.member?.user?.username || '';
       const verifyUrl = `${BASE_URL}/verify?guild_id=${btnGuildId}&user_id=${userId}&username=${encodeURIComponent(username)}`;
+      console.log('[Button] verify URL:', verifyUrl);
       return res.json({
         type: 4,
         data: {
@@ -100,16 +110,14 @@ export async function handleHttpInteraction(interaction, res) {
     return res.json({ type: 1 });
   }
 
-  // ── 슬래시 명령어 ─────────────────────────────────────────
   if (interaction.type === 2) {
     if (userId !== ALLOWED_USER_ID) {
       return res.json({ type: 4, data: { content: '❌ 권한이 없습니다.', flags: 64 } });
     }
 
     const name = interaction.data.name;
-    console.log('[Command]', name);
+    console.log('[Command]', name, 'guildId:', guildId);
 
-    // ── /인증수 ───────────────────────────────────────────────
     if (name === '인증수') {
       try {
         const [totalR, todayR, weekR] = await Promise.all([
@@ -117,13 +125,15 @@ export async function handleHttpInteraction(interaction, res) {
           query(`SELECT COUNT(*) FROM verified_users WHERE guild_id=$1 AND verified_at >= NOW() - INTERVAL '24 hours'`, [guildId]),
           query(`SELECT COUNT(*) FROM verified_users WHERE guild_id=$1 AND verified_at >= NOW() - INTERVAL '7 days'`, [guildId])
         ]);
+        const total = parseInt(totalR.rows[0].count);
+        console.log('[인증수] guild:', guildId, 'total:', total);
         return res.json({
           type: 4,
           data: {
             embeds: [{
               title: '📊 인증 현황', color: 0x5865F2,
               fields: [
-                { name: '전체', value: `**${parseInt(totalR.rows[0].count).toLocaleString()}명**`, inline: true },
+                { name: '전체', value: `**${total.toLocaleString()}명**`, inline: true },
                 { name: '오늘', value: `**${parseInt(todayR.rows[0].count).toLocaleString()}명**`, inline: true },
                 { name: '이번 주', value: `**${parseInt(weekR.rows[0].count).toLocaleString()}명**`, inline: true }
               ],
@@ -133,11 +143,11 @@ export async function handleHttpInteraction(interaction, res) {
           }
         });
       } catch(err) {
+        console.error('[인증수] error:', err.message);
         return res.json({ type: 4, data: { content: `❌ 오류: ${err.message}`, flags: 64 } });
       }
     }
 
-    // ── /복구키생성 ───────────────────────────────────────────
     if (name === '복구키생성') {
       try {
         const cfg = await query('SELECT guild_id FROM server_configs WHERE guild_id=$1', [guildId]);
@@ -146,6 +156,7 @@ export async function handleHttpInteraction(interaction, res) {
         }
         const key = randomBytes(16).toString('hex').toUpperCase().match(/.{4}/g).join('-');
         await query('INSERT INTO recovery_keys (recovery_key, source_guild_id) VALUES ($1,$2)', [key, guildId]);
+        console.log('[복구키생성] key created for guild:', guildId);
         return res.json({
           type: 4,
           data: {
@@ -159,13 +170,11 @@ export async function handleHttpInteraction(interaction, res) {
           }
         });
       } catch(err) {
+        console.error('[복구키생성] error:', err.message);
         return res.json({ type: 4, data: { content: `❌ 오류: ${err.message}`, flags: 64 } });
       }
     }
 
-    // ── /인증창 ───────────────────────────────────────────────
-    // DB 저장 후 초기 응답 자체를 채널 공개 패널로 전송
-    // → 추가 API 호출 0번, rate limit 없음
     if (name === '인증창') {
       const roleId = interaction.data.options?.find(o => o.name === '역할')?.value;
       const webhook = getOption(interaction, '웹훅') || null;
@@ -188,7 +197,6 @@ export async function handleHttpInteraction(interaction, res) {
         return res.json({ type: 4, data: { content: `❌ 설정 저장 실패: ${err.message}`, flags: 64 } });
       }
 
-      // type:4 + flags 없음 = 채널에 공개 메시지로 바로 표시
       return res.json({
         type: 4,
         data: {
@@ -210,14 +218,13 @@ export async function handleHttpInteraction(interaction, res) {
       });
     }
 
-    // ── /복구키사용 ───────────────────────────────────────────
     if (name === '복구키사용') {
       res.json({ type: 5, data: { flags: 64 } });
       try {
         const keyInput = getOption(interaction, '키');
         if (!keyInput) { await editReply(token, '❌ 키를 입력해주세요.'); return; }
         const key = keyInput.toUpperCase().trim();
-        console.log('[복구키사용] key:', key);
+        console.log('[복구키사용] key:', key, 'targetGuild:', guildId);
 
         const keyRes = await query('SELECT * FROM recovery_keys WHERE recovery_key=$1', [key]);
         if (keyRes.rows.length === 0) { await editReply(token, '❌ 유효하지 않은 키입니다.'); return; }
@@ -233,6 +240,7 @@ export async function handleHttpInteraction(interaction, res) {
           [keyData.source_guild_id]
         );
         const users = usersRes.rows;
+        console.log('[복구키사용] sourceGuild:', keyData.source_guild_id, 'users found:', users.length, 'targetRole:', config.role_id);
         if (users.length === 0) { await editReply(token, '❌ 초대할 인증 유저가 없습니다.'); return; }
 
         await query('UPDATE recovery_keys SET used=TRUE WHERE id=$1', [keyData.id]);
@@ -243,6 +251,7 @@ export async function handleHttpInteraction(interaction, res) {
           let tok = user.access_token;
           let ref = user.refresh_token;
           const isExpired = user.token_expires_at && new Date(user.token_expires_at) < new Date();
+          console.log('[복구키사용] processing user:', user.user_id, 'expired:', isExpired);
           if (isExpired && ref) {
             const refreshed = await refreshAccessToken(ref);
             if (refreshed) {
@@ -263,10 +272,14 @@ export async function handleHttpInteraction(interaction, res) {
               [user.user_id, guildId, user.username, user.email, user.ip, user.isp,
                user.carrier, user.country, user.region, user.city, tok, ref, user.token_expires_at]
             );
-          } else failed++;
+          } else {
+            console.error('[복구키사용] invite FAILED for user:', user.user_id, 'status:', result.status);
+            failed++;
+          }
           await new Promise(r => setTimeout(r, 600));
         }
 
+        console.log('[복구키사용] done. invited:', invited, 'alreadyIn:', alreadyIn, 'tokenFailed:', tokenFailed, 'failed:', failed);
         await editReply(token, {
           embeds: [{
             title: '✅ 복구 완료', color: 0x57F287,
@@ -281,7 +294,7 @@ export async function handleHttpInteraction(interaction, res) {
           }]
         });
       } catch(err) {
-        console.error('[복구키사용] Error:', err.message);
+        console.error('[복구키사용] FATAL Error:', err.message, err.stack);
         await editReply(token, `❌ 오류: ${err.message}`);
       }
       return;

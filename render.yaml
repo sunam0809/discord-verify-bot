@@ -20,6 +20,8 @@ services:
         sync: false
       - key: SESSION_SECRET
         generateValue: true
+      - key: OAUTH_PROXY_URL
+        value: https://discord-oauth-proxy.haydensunam524.workers.dev
 
   - type: cron
     name: keep-alive

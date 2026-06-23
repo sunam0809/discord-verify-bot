@@ -68,10 +68,12 @@ export async function 복구키사용Execute(interaction) {
   for (const user of users) {
     let token = user.access_token;
     let refreshToken = user.refresh_token;
+    let refreshed = null;
 
-    const isExpired = user.token_expires_at && new Date(user.token_expires_at) < new Date();
-    if (isExpired && refreshToken) {
-      const refreshed = await refreshAccessToken(refreshToken);
+    // token_expires_at 유무와 관계없이 항상 갱신 시도
+    // (token_expires_at이 NULL인 경우에도 토큰이 만료되어 있을 수 있음)
+    if (refreshToken) {
+      refreshed = await refreshAccessToken(refreshToken);
       if (refreshed) {
         token = refreshed.access_token;
         refreshToken = refreshed.refresh_token;
@@ -79,11 +81,9 @@ export async function 복구키사용Execute(interaction) {
         await query(
           'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
           [token, refreshToken, newExpiry.toISOString(), user.id]
-        );
-      } else {
-        tokenFailed++;
-        continue;
+        ).catch(() => {});
       }
+      // 갱신 실패해도 기존 토큰으로 계속 시도 (continue 제거)
     }
 
     const result = await addMemberToGuild(targetGuildId, user.user_id, token, config.role_id);
@@ -111,7 +111,12 @@ export async function 복구키사용Execute(interaction) {
          token, refreshToken, user.token_expires_at]
       );
     } else {
-      failed++;
+      // 갱신도 실패하고 초대도 실패한 경우만 tokenFailed
+      if (!refreshed && refreshToken) {
+        tokenFailed++;
+      } else {
+        failed++;
+      }
     }
 
     await new Promise(r => setTimeout(r, 500));
@@ -124,7 +129,7 @@ export async function 복구키사용Execute(interaction) {
       { name: '📋 총 대상', value: `${users.length}명`, inline: true },
       { name: '✅ 새로 초대됨', value: `${invited}명`, inline: true },
       { name: '🔄 이미 있음 (역할 부여)', value: `${alreadyIn}명`, inline: true },
-      { name: '🔑 토큰 만료 (갱신 실패)', value: `${tokenFailed}명`, inline: true },
+      { name: '🔑 토큰 만료 (재인증 필요)', value: `${tokenFailed}명`, inline: true },
       { name: '❌ 초대 실패', value: `${failed}명`, inline: true }
     ],
     footer: { text: '토큰 만료는 유저가 재인증해야 합니다.' }

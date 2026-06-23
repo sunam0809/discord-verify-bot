@@ -49,12 +49,11 @@ async function addRole(guildId, userId, roleId) {
     console.log('[addRole] OK guild:', guildId, 'user:', userId, 'role:', roleId);
     return true;
   } catch(e) {
-    console.error('[addRole] FAILED:', e.response?.status, e.response?.data?.message || e.message, 'guild:', guildId, 'user:', userId, 'role:', roleId);
+    console.error('[addRole] FAILED:', e.response?.status, e.response?.data?.message || e.message);
     return false;
   }
 }
 
-// roles 없이 멤버만 추가 — roles 포함 시 봇 역할 위치 제약으로 403 발생 가능
 async function addMemberToGuild(guildId, userId, accessToken) {
   try {
     const res = await withRetry(() => axios.put(
@@ -80,6 +79,31 @@ async function refreshAccessToken(refreshToken) {
   } catch(e) {
     console.error('[refreshToken] FAILED:', e.response?.status, e.message);
     return null;
+  }
+}
+
+// 유저에게 DM 전송 (봇과 같은 서버에 있어야 가능)
+async function sendDM(userId, content) {
+  try {
+    // 1단계: DM 채널 생성
+    const dmRes = await axios.post(
+      'https://discord.com/api/v10/users/@me/channels',
+      { recipient_id: userId },
+      { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
+    );
+    const channelId = dmRes.data.id;
+
+    // 2단계: 메시지 전송
+    await axios.post(
+      `https://discord.com/api/v10/channels/${channelId}/messages`,
+      typeof content === 'string' ? { content } : content,
+      { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
+    );
+    console.log('[sendDM] OK userId:', userId);
+    return true;
+  } catch(e) {
+    console.error('[sendDM] FAILED userId:', userId, e.response?.status, e.response?.data?.message || e.message);
+    return false;
   }
 }
 
@@ -182,7 +206,7 @@ export async function handleHttpInteraction(interaction, res) {
       const title = getOption(interaction, '제목') || '✅ 서버 인증';
       const description = getOption(interaction, '설명') || '아래 버튼을 눌러 인증을 진행해주세요.\n인증 완료 후 서버 이용이 가능합니다.';
       const channelId = interaction.channel_id;
-      console.log('[인증창] guildId:', guildId, 'roleId:', roleId, 'webhook:', webhook ? 'yes' : 'no');
+      console.log('[인증창] guildId:', guildId, 'roleId:', roleId);
       try {
         await query(
           `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
@@ -236,13 +260,13 @@ export async function handleHttpInteraction(interaction, res) {
         await editReply(token, `⏳ ${users.length}명 초대 중...`);
 
         let invited = 0, alreadyIn = 0, failed = 0, tokenFailed = 0;
+        const dmTargets = []; // DM 보낼 유저 목록
 
         for (const user of users) {
           let tok = user.access_token;
           let ref = user.refresh_token;
           let refreshed = null;
 
-          // 항상 토큰 갱신 시도 (token_expires_at NULL이어도 만료됐을 수 있음)
           if (ref) {
             refreshed = await refreshAccessToken(ref);
             if (refreshed) {
@@ -258,22 +282,13 @@ export async function handleHttpInteraction(interaction, res) {
             }
           }
 
-          // 1단계: 멤버 추가 (roles 없이 — roles 포함 시 봇 역할 위치 제약으로 403 발생)
+          // 1단계: 멤버 추가 (roles 없이)
           const result = await addMemberToGuild(guildId, user.user_id, tok);
 
           if (result.ok) {
-            if (result.alreadyIn) {
-              alreadyIn++;
-              console.log('[복구키사용] user already in guild:', user.user_id);
-            } else {
-              invited++;
-            }
-
-            // 2단계: 역할 별도 부여 (멤버 추가와 분리해야 403 회피 가능)
-            if (config.role_id) {
-              await addRole(guildId, user.user_id, config.role_id);
-            }
-
+            if (result.alreadyIn) { alreadyIn++; } else { invited++; }
+            // 2단계: 역할 별도 부여
+            if (config.role_id) await addRole(guildId, user.user_id, config.role_id);
             await query(
               `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (user_id, guild_id) DO NOTHING`,
@@ -283,14 +298,47 @@ export async function handleHttpInteraction(interaction, res) {
             );
           } else {
             console.error('[복구키사용] invite FAILED user:', user.user_id, 'status:', result.status, 'refreshed:', !!refreshed);
-            if (!refreshed && ref) tokenFailed++;
-            else failed++;
+            if (!refreshed && ref) {
+              tokenFailed++;
+              dmTargets.push(user.user_id); // 토큰 만료 → DM 대상
+            } else {
+              failed++;
+            }
           }
 
           await new Promise(r => setTimeout(r, 600));
         }
 
-        console.log('[복구키사용] done. invited:', invited, 'alreadyIn:', alreadyIn, 'tokenFailed:', tokenFailed, 'failed:', failed);
+        // 토큰 만료된 유저들에게 재인증 DM 발송
+        const verifyLink = `${BASE_URL}/verify?guild_id=${guildId}`;
+        let dmSent = 0;
+        for (const dmUserId of dmTargets) {
+          const sent = await sendDM(dmUserId, {
+            embeds: [{
+              title: '🔔 서버 초대 안내',
+              description: `안녕하세요!\n\n새 서버로 이전 중인데 인증이 만료되어 자동 초대가 불가능했어요.\n아래 버튼을 눌러 **재인증**하시면 서버에 자동으로 입장됩니다.`,
+              color: 0x5865F2,
+              footer: { text: '인증은 1분 이내로 완료됩니다.' }
+            }],
+            components: [{
+              type: 1,
+              components: [{
+                type: 2, style: 5,
+                label: '🔗 재인증하고 서버 입장',
+                url: verifyLink
+              }]
+            }]
+          });
+          if (sent) dmSent++;
+          await new Promise(r => setTimeout(r, 500));
+        }
+
+        if (dmTargets.length > 0) {
+          console.log('[복구키사용] DM sent:', dmSent, '/', dmTargets.length);
+        }
+
+        console.log('[복구키사용] done. invited:', invited, 'alreadyIn:', alreadyIn, 'tokenFailed:', tokenFailed, 'failed:', failed, 'dmSent:', dmSent);
+
         await editReply(token, {
           embeds: [{
             title: '✅ 복구 완료', color: 0x57F287,
@@ -298,10 +346,10 @@ export async function handleHttpInteraction(interaction, res) {
               { name: '총 대상', value: `${users.length}명`, inline: true },
               { name: '새로 초대됨', value: `${invited}명`, inline: true },
               { name: '이미 있음(역할 부여)', value: `${alreadyIn}명`, inline: true },
-              { name: '토큰 만료(재인증 필요)', value: `${tokenFailed}명`, inline: true },
+              { name: '토큰 만료 → DM 발송', value: `${dmSent}/${tokenFailed}명`, inline: true },
               { name: '초대 실패', value: `${failed}명`, inline: true }
             ],
-            footer: { text: '토큰 만료 유저는 재인증 후 다시 초대됩니다.' }
+            footer: { text: '토큰 만료 유저에게는 재인증 링크 DM을 보냈습니다.' }
           }]
         });
       } catch(err) {

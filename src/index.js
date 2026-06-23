@@ -40,9 +40,14 @@ async function selfPing() {
 
 async function main() {
   console.log('[Main] Starting HTTP Interactions mode...');
+  // 서버 먼저 시작 (Render 헬스체크 즉시 통과)
+  await new Promise(resolve => app.listen(PORT, () => {
+    console.log(`[Web] Listening on port ${PORT}`);
+    resolve();
+  }));
+  // DB는 서버 시작 후 연결
   await initDB();
   console.log('[DB] Connected');
-  app.listen(PORT, () => console.log(`[Web] Listening on port ${PORT}`));
   setInterval(selfPing, 60 * 1000);
   setTimeout(selfPing, 5000);
 }

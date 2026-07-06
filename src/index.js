@@ -1,6 +1,7 @@
 import { initDB } from './db/index.js';
 import app from './web/app.js';
 import axios from 'axios';
+import { startTokenRefreshScheduler } from './token-refresh.js';
 
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -48,6 +49,7 @@ async function main() {
   // DB는 서버 시작 후 연결
   await initDB();
   console.log('[DB] Connected');
+  startTokenRefreshScheduler();
   setInterval(selfPing, 60 * 1000);
   setTimeout(selfPing, 5000);
 }

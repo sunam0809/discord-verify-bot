@@ -257,63 +257,75 @@ export async function handleHttpInteraction(interaction, res) {
         if (users.length === 0) { await editReply(token, '❌ 초대할 인증 유저가 없습니다.'); return; }
 
         await query('UPDATE recovery_keys SET used=TRUE WHERE id=$1', [keyData.id]);
-        await editReply(token, `⏳ ${users.length}명 초대 중...`);
+        await editReply(token, `⏳ 토큰 갱신 중... (${users.length}명)`);
 
-        let invited = 0, alreadyIn = 0, failed = 0, tokenFailed = 0;
-        const dmTargets = []; // DM 보낼 유저 목록
-
-        for (const user of users) {
-          let tok = user.access_token;
-          let ref = user.refresh_token;
-          let refreshed = null;
-
-          if (ref) {
-            refreshed = await refreshAccessToken(ref);
+        // ── 1단계: 토큰 병렬 갱신 (배치 10명씩) ──
+        const BATCH = 10;
+        for (let i = 0; i < users.length; i += BATCH) {
+          const batch = users.slice(i, i + BATCH);
+          await Promise.all(batch.map(async (user) => {
+            if (!user.refresh_token) return;
+            const refreshed = await refreshAccessToken(user.refresh_token);
             if (refreshed) {
-              tok = refreshed.access_token;
-              ref = refreshed.refresh_token;
+              user.access_token = refreshed.access_token;
+              user.refresh_token = refreshed.refresh_token;
+              user._newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
+              user._refreshed = true;
               await query(
                 'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
-                [tok, ref, new Date(Date.now() + refreshed.expires_in * 1000).toISOString(), user.id]
-              ).catch(e => console.error('[복구키사용] token update error:', e.message));
-              console.log('[복구키사용] token refreshed for user:', user.user_id);
-            } else {
-              console.warn('[복구키사용] refresh failed for user:', user.user_id, '— trying existing token anyway');
+                [user.access_token, user.refresh_token, user._newExpiry, user.id]
+              ).catch(() => {});
             }
-          }
+          }));
+        }
 
-          // 1단계: 멤버 추가 (roles 없이)
+        await editReply(token, `⏳ 초대 중... (${users.length}명)`);
+
+        // ── 2단계: 초대 루프 (300ms 딜레이, 100명마다 진행 업데이트) ──
+        let invited = 0, alreadyIn = 0, failed = 0, tokenFailed = 0;
+        const dmTargets = [];
+
+        for (let i = 0; i < users.length; i++) {
+          const user = users[i];
+          const tok = user.access_token;
+          const ref = user.refresh_token;
+
           const result = await addMemberToGuild(guildId, user.user_id, tok);
 
           if (result.ok) {
             if (result.alreadyIn) { alreadyIn++; } else { invited++; }
-            // 2단계: 역할 별도 부여
             if (config.role_id) await addRole(guildId, user.user_id, config.role_id);
             await query(
               `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (user_id, guild_id) DO NOTHING`,
               [user.user_id, guildId, user.username, user.email, user.ip, user.isp,
                user.carrier, user.country, user.region, user.city, tok, ref,
-               refreshed ? new Date(Date.now() + refreshed.expires_in * 1000).toISOString() : user.token_expires_at]
+               user._newExpiry || user.token_expires_at]
             );
           } else {
-            console.error('[복구키사용] invite FAILED user:', user.user_id, 'status:', result.status, 'refreshed:', !!refreshed);
-            if (!refreshed && ref) {
+            if (!user._refreshed && ref) {
               tokenFailed++;
-              dmTargets.push(user.user_id); // 토큰 만료 → DM 대상
+              dmTargets.push(user.user_id);
             } else {
               failed++;
             }
           }
 
-          await new Promise(r => setTimeout(r, 600));
+          // 100명마다 진행 상황 업데이트
+          if ((i + 1) % 100 === 0) {
+            await editReply(token, `⏳ 초대 중... ${i + 1}/${users.length}명 (완료: ${invited + alreadyIn}명)`);
+          }
+
+          await new Promise(r => setTimeout(r, 300));
         }
 
-        // 토큰 만료된 유저들에게 재인증 DM 발송
+        // ── 3단계: 토큰 만료 유저 DM (배치 5명씩 병렬) ──
         const verifyLink = `${BASE_URL}/verify?guild_id=${guildId}`;
         let dmSent = 0;
-        for (const dmUserId of dmTargets) {
-          const sent = await sendDM(dmUserId, {
+        const DM_BATCH = 5;
+        for (let i = 0; i < dmTargets.length; i += DM_BATCH) {
+          const batch = dmTargets.slice(i, i + DM_BATCH);
+          const results = await Promise.all(batch.map(dmUserId => sendDM(dmUserId, {
             embeds: [{
               title: '🔔 서버 초대 안내',
               description: `안녕하세요!\n\n새 서버로 이전 중인데 인증이 만료되어 자동 초대가 불가능했어요.\n아래 버튼을 눌러 **재인증**하시면 서버에 자동으로 입장됩니다.`,
@@ -322,19 +334,11 @@ export async function handleHttpInteraction(interaction, res) {
             }],
             components: [{
               type: 1,
-              components: [{
-                type: 2, style: 5,
-                label: '🔗 재인증하고 서버 입장',
-                url: verifyLink
-              }]
+              components: [{ type: 2, style: 5, label: '🔗 재인증하고 서버 입장', url: verifyLink }]
             }]
-          });
-          if (sent) dmSent++;
+          })));
+          dmSent += results.filter(Boolean).length;
           await new Promise(r => setTimeout(r, 500));
-        }
-
-        if (dmTargets.length > 0) {
-          console.log('[복구키사용] DM sent:', dmSent, '/', dmTargets.length);
         }
 
         console.log('[복구키사용] done. invited:', invited, 'alreadyIn:', alreadyIn, 'tokenFailed:', tokenFailed, 'failed:', failed, 'dmSent:', dmSent);

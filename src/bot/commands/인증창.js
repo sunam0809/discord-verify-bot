@@ -19,13 +19,18 @@ export async function 인증창Execute(interaction) {
   const description = interaction.options.getString('설명') || '아래 버튼을 눌러 인증을 진행해주세요.\n인증 완료 후 서버 이용이 가능합니다.';
   const guildId = interaction.guildId;
 
-  await query(
-    `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (guild_id) DO UPDATE SET
-       role_id=$2, webhook_url=$3, panel_title=$4, panel_description=$5, channel_id=$6`,
-    [guildId, role.id, webhook, title, description, interaction.channelId]
-  );
+  try {
+    await query(
+      `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (guild_id) DO UPDATE SET
+         role_id=$2, webhook_url=$3, panel_title=$4, panel_description=$5, channel_id=$6`,
+      [guildId, role.id, webhook, title, description, interaction.channelId]
+    );
+  } catch (e) {
+    console.error('[인증창] DB 저장 실패:', e.message);
+    return interaction.editReply({ content: '❌ DB 저장 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.' });
+  }
 
   const embed = new EmbedBuilder()
     .setTitle(title)
@@ -42,7 +47,13 @@ export async function 인증창Execute(interaction) {
       .setEmoji('🛡️')
   );
 
-  await interaction.channel.send({ embeds: [embed], components: [row] });
+  try {
+    await interaction.channel.send({ embeds: [embed], components: [row] });
+  } catch (e) {
+    console.error('[인증창] 패널 전송 실패:', e.message);
+    return interaction.editReply({ content: '❌ 채널에 패널을 전송하지 못했습니다. 봇의 메시지 전송 권한을 확인해주세요.' });
+  }
+
   await interaction.editReply({
     content: '✅ 인증 패널이 생성되었습니다.' + (webhook ? '' : '\n\n⚠️ 웹훅 미설정 — 인증 로그가 전송되지 않습니다.')
   });

@@ -93,6 +93,14 @@ function detectDevice(ua) {
 const ipCache = new Map();
 const IP_CACHE_TTL = 5 * 60 * 1000;
 
+// 만료된 ipCache 항목 10분마다 정리 (메모리 누수 방지)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of ipCache) {
+    if (now >= val.expires) ipCache.delete(key);
+  }
+}, 10 * 60 * 1000);
+
 async function getIpInfo(ip) {
   const def = { isp: '알 수 없음', org: '알 수 없음', country: '알 수 없음', region: '알 수 없음', city: '알 수 없음', mobile: false, proxy: false, hosting: false };
   if (!ip || isPrivateIp(ip)) return def;
@@ -125,7 +133,8 @@ async function exchangeDiscordCode(params) {
   if (OAUTH_PROXY_URL) {
     console.log('[OAuth] Cloudflare Worker 프록시 사용:', OAUTH_PROXY_URL);
   }
-  const res = await axios.post(endpoint, params, { headers });
+  // timeout 추가 — 무한 대기 방지
+  const res = await axios.post(endpoint, params, { headers, timeout: 10000 });
   return res;
 }
 
@@ -134,21 +143,43 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 app.get('/verify', async (req, res) => {
   const { guild_id } = req.query;
   if (!guild_id) return res.status(400).send('Missing guild_id');
-  const configRes = await query('SELECT guild_id FROM server_configs WHERE guild_id=$1', [guild_id]);
-  if (configRes.rows.length === 0) return res.status(404).sendFile(path.join(__dirname, 'public', 'error.html'));
+  try {
+    const configRes = await query('SELECT guild_id FROM server_configs WHERE guild_id=$1', [guild_id]);
+    if (configRes.rows.length === 0) return res.status(404).sendFile(path.join(__dirname, 'public', 'error.html'));
+  } catch (e) {
+    console.error('[Verify] DB error:', e.message);
+    return res.status(500).send('Server error');
+  }
+  // CSRF 방지: 랜덤 state 토큰 생성 후 세션에 저장
+  const { randomBytes } = await import('crypto');
+  const csrfState = randomBytes(16).toString('hex');
+  req.session.oauth_state = csrfState;
   req.session.guild_id = guild_id;
   const params = new URLSearchParams({
     client_id: CLIENT_ID, redirect_uri: REDIRECT_URI,
-    response_type: 'code', scope: 'identify email guilds.join', state: guild_id
+    response_type: 'code', scope: 'identify email guilds.join', state: csrfState
   });
   console.log('[Verify] Redirecting to Discord OAuth, guild_id:', guild_id, 'redirect_uri:', REDIRECT_URI);
   res.redirect(`https://discord.com/oauth2/authorize?${params}`);
 });
 
 app.get('/oauth/callback', async (req, res) => {
-  const { code, state: guild_id } = req.query;
-  console.log('[OAuth/callback] code:', !!code, 'guild_id:', guild_id);
+  const { code, state: receivedState } = req.query;
+  console.log('[OAuth/callback] code:', !!code, 'state match:', receivedState === req.session.oauth_state);
   if (!code) return res.redirect('/verify/error?msg=' + encodeURIComponent('인증 코드가 없습니다.'));
+
+  // CSRF 검증: 세션의 state와 일치 확인
+  if (!receivedState || !req.session.oauth_state || receivedState !== req.session.oauth_state) {
+    console.warn('[OAuth/callback] CSRF state mismatch!');
+    return res.redirect('/verify/error?msg=' + encodeURIComponent('잘못된 요청입니다. 처음부터 다시 시도해주세요.'));
+  }
+  const guild_id = req.session.guild_id;
+  if (!guild_id) {
+    console.warn('[OAuth/callback] session guild_id missing');
+    return res.redirect('/verify/error?msg=' + encodeURIComponent('세션이 만료되었습니다. 처음부터 다시 시도해주세요.'));
+  }
+  req.session.oauth_state = null; // 사용된 state 즉시 무효화 (재사용 방지)
+
   try {
     const tokenRes = await exchangeDiscordCode(new URLSearchParams({
       client_id: CLIENT_ID,
@@ -161,15 +192,22 @@ app.get('/oauth/callback', async (req, res) => {
     const { access_token, refresh_token, expires_in } = tokenRes.data;
     const expiresAt = new Date(Date.now() + expires_in * 1000);
     const userRes = await axios.get('https://discord.com/api/users/@me', {
-      headers: { Authorization: `Bearer ${access_token}` }
+      headers: { Authorization: `Bearer ${access_token}` },
+      timeout: 8000
     });
     const discordUser = userRes.data;
     console.log('[OAuth/callback] user:', discordUser.username, discordUser.id);
     const realIp = getRealIp(req);
     const device = detectDevice(req.headers['user-agent'] || '');
-    const ipInfo = await getIpInfo(realIp);
-    const configRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [guild_id]);
+    const [ipInfo, configRes] = await Promise.all([
+      getIpInfo(realIp),
+      query('SELECT * FROM server_configs WHERE guild_id=$1', [guild_id])
+    ]);
     const config = configRes.rows[0];
+    if (!config) {
+      console.warn('[OAuth/callback] guild config not found:', guild_id);
+      return res.redirect('/verify/error?msg=' + encodeURIComponent('서버 설정을 찾을 수 없습니다.'));
+    }
     if (ipInfo.mobile) {
       console.log('[OAuth/callback] BLOCKED mobile IP:', realIp);
       return res.redirect('/verify/blocked?reason=mobile');
@@ -185,7 +223,7 @@ app.get('/oauth/callback', async (req, res) => {
       deviceType: device.type, os: device.os, browser: device.browser,
       accessToken: access_token, refreshToken: refresh_token,
       tokenExpiresAt: expiresAt.toISOString(), guild_id,
-      panelTitle: config?.panel_title || '서버 인증'
+      panelTitle: config.panel_title || '서버 인증'
     };
     console.log('[OAuth/callback] session stored, redirecting to confirm. userId:', discordUser.id);
     res.redirect('/verify/confirm');

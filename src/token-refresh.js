@@ -44,57 +44,70 @@ async function refreshToken(refreshToken) {
   }
 }
 
-export async function runTokenRefresh() {
-  console.log('[TokenRefresh] 전체 토큰 갱신 시작...');
+let isRefreshing = false;
 
-  // refresh_token이 있는 유저만 대상
-  let rows;
-  try {
-    const res = await query(
-      'SELECT id, user_id, refresh_token FROM verified_users WHERE refresh_token IS NOT NULL',
-    );
-    rows = res.rows;
-  } catch (err) {
-    console.error('[TokenRefresh] DB 조회 실패:', err.message);
+export async function runTokenRefresh() {
+  // 동시 실행 방지 — 이전 실행이 끝나지 않았으면 스킵
+  if (isRefreshing) {
+    console.warn('[TokenRefresh] 이미 실행 중, 이번 회차 스킵');
     return;
   }
+  isRefreshing = true;
+  console.log('[TokenRefresh] 전체 토큰 갱신 시작...');
 
-  console.log(`[TokenRefresh] 대상 유저: ${rows.length}명`);
-
-  let success = 0;
-  let failed = 0;
-
-  for (const user of rows) {
-    const result = await refreshToken(user.refresh_token);
-
-    if (result) {
-      const newExpiry = new Date(Date.now() + result.expires_in * 1000);
-      try {
-        await query(
-          'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
-          [result.access_token, result.refresh_token, newExpiry.toISOString(), user.id],
-        );
-        success++;
-      } catch (err) {
-        console.error(`[TokenRefresh] DB 업데이트 실패 (user ${user.user_id}):`, err.message);
-        failed++;
-      }
-    } else {
-      // 갱신 실패 = refresh token 자체가 만료됨 (유저가 앱 권한 해제 등)
-      // access_token만 null 처리해서 재인증 필요 상태로 표시
-      try {
-        await query(
-          'UPDATE verified_users SET access_token=NULL, refresh_token=NULL, token_expires_at=NULL WHERE id=$1',
-          [user.id],
-        );
-      } catch {}
-      failed++;
+  try {
+    // refresh_token이 있는 유저만 대상
+    let rows;
+    try {
+      const res = await query(
+        'SELECT id, user_id, refresh_token FROM verified_users WHERE refresh_token IS NOT NULL',
+      );
+      rows = res.rows;
+    } catch (err) {
+      console.error('[TokenRefresh] DB 조회 실패:', err.message);
+      return;
     }
 
-    await sleep(DELAY_MS);
-  }
+    console.log(`[TokenRefresh] 대상 유저: ${rows.length}명`);
 
-  console.log(`[TokenRefresh] 완료 — 성공: ${success}명, 실패(재인증 필요): ${failed}명`);
+    let success = 0;
+    let failed = 0;
+
+    for (const user of rows) {
+      const result = await refreshToken(user.refresh_token);
+
+      if (result) {
+        const newExpiry = new Date(Date.now() + result.expires_in * 1000);
+        try {
+          await query(
+            'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
+            [result.access_token, result.refresh_token, newExpiry.toISOString(), user.id],
+          );
+          success++;
+        } catch (err) {
+          console.error(`[TokenRefresh] DB 업데이트 실패 (user ${user.user_id}):`, err.message);
+          failed++;
+        }
+      } else {
+        // 갱신 실패 = refresh token 자체가 만료됨 (유저가 앱 권한 해제 등)
+        // 토큰 null 처리해서 재인증 필요 상태로 표시
+        try {
+          await query(
+            'UPDATE verified_users SET access_token=NULL, refresh_token=NULL, token_expires_at=NULL WHERE id=$1',
+            [user.id],
+          );
+        } catch {}
+        failed++;
+      }
+
+      await sleep(DELAY_MS);
+    }
+
+    console.log(`[TokenRefresh] 완료 — 성공: ${success}명, 실패(재인증 필요): ${failed}명`);
+  } finally {
+    // 예외 발생 시에도 반드시 플래그 해제
+    isRefreshing = false;
+  }
 }
 
 export function startTokenRefreshScheduler() {

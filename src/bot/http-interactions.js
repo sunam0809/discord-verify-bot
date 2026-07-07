@@ -6,6 +6,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const APP_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const BASE_URL = process.env.BASE_URL;
+const OAUTH_PROXY_URL = process.env.OAUTH_PROXY_URL || null;
 
 async function withRetry(fn, maxAttempts = 6) {
   for (let i = 0; i < maxAttempts; i++) {
@@ -71,7 +72,9 @@ async function addMemberToGuild(guildId, userId, accessToken) {
 
 async function refreshAccessToken(refreshToken) {
   try {
-    const res = await axios.post('https://discord.com/api/oauth2/token',
+    // OAUTH_PROXY_URL이 설정된 경우 프록시 사용 (app.js와 동일하게)
+    const endpoint = OAUTH_PROXY_URL || 'https://discord.com/api/oauth2/token';
+    const res = await axios.post(endpoint,
       new URLSearchParams({ client_id: APP_ID, client_secret: CLIENT_SECRET, grant_type: 'refresh_token', refresh_token: refreshToken }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 8000 }
     );
@@ -138,6 +141,12 @@ export async function handleHttpInteraction(interaction, res) {
   if (interaction.type === 2) {
     if (userId !== ALLOWED_USER_ID) {
       return res.json({ type: 4, data: { content: '❌ 권한이 없습니다.', flags: 64 } });
+    }
+
+    // interaction.data 누락 시 방어
+    if (!interaction.data) {
+      console.error('[Interaction] type=2 but interaction.data is missing');
+      return res.json({ type: 4, data: { content: '❌ 잘못된 요청입니다.', flags: 64 } });
     }
 
     const name = interaction.data.name;

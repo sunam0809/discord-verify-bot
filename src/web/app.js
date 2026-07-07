@@ -40,8 +40,28 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'verify_secret_key',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: process.env.NODE_ENV === 'production', maxAge: 10 * 60 * 1000 }
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',   // CSRF 방어: 외부 사이트 POST 요청 시 세션 쿠키 전송 차단
+    maxAge: 10 * 60 * 1000
+  }
 }));
+
+// /api/verify-complete CSRF 방어 미들웨어
+function verifySameOrigin(req, res, next) {
+  const origin = req.headers.origin;
+  const referer = req.headers.referer;
+  const allowed = BASE_URL;
+  const isValid =
+    (origin && origin.startsWith(allowed)) ||
+    (referer && referer.startsWith(allowed)) ||
+    (!origin && !referer); // 서버사이드 요청 허용
+  if (!isValid) {
+    console.warn('[CSRF] 차단됨 — origin:', origin, 'referer:', referer);
+    return res.status(403).json({ success: false, error: '잘못된 요청입니다.' });
+  }
+  next();
+}
 app.use(express.static(path.join(__dirname, 'public')));
 
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -257,7 +277,7 @@ app.get('/api/verify-data', (req, res) => {
   res.json({ userId: d.userId, username: d.username, globalName: d.globalName, avatar: d.avatar, panelTitle: d.panelTitle });
 });
 
-app.post('/api/verify-complete', async (req, res) => {
+app.post('/api/verify-complete', verifySameOrigin, async (req, res) => {
   const hasPending = !!req.session.pendingVerify;
   console.log('[/api/verify-complete] called, hasPendingVerify:', hasPending);
   if (!hasPending) return res.status(401).json({ success: false, error: '세션이 만료되었습니다.' });

@@ -265,7 +265,7 @@ export async function handleHttpInteraction(interaction, res) {
         console.log('[복구키사용] sourceGuild:', keyData.source_guild_id, 'users:', users.length, 'targetRole:', config.role_id);
         if (users.length === 0) { await editReply(token, '❌ 초대할 인증 유저가 없습니다.'); return; }
 
-        await query('UPDATE recovery_keys SET used=TRUE WHERE id=$1', [keyData.id]);
+        // 키는 작업 완료 후에 소모 처리 — 실패 시 재시도 가능하도록 아직 사용하지 않음
         await editReply(token, `⏳ 토큰 갱신 중... (${users.length}명)`);
 
         // ── 1단계: 토큰 병렬 갱신 (배치 10명씩) ──
@@ -351,6 +351,9 @@ export async function handleHttpInteraction(interaction, res) {
         }
 
         console.log('[복구키사용] done. invited:', invited, 'alreadyIn:', alreadyIn, 'tokenFailed:', tokenFailed, 'failed:', failed, 'dmSent:', dmSent);
+
+        // 모든 작업이 끝난 뒤에만 키 소모 처리 (실패 시 재시도 가능)
+        await query('UPDATE recovery_keys SET used=TRUE WHERE id=$1', [keyData.id]);
 
         await editReply(token, {
           embeds: [{

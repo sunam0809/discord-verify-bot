@@ -13,7 +13,7 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const OAUTH_PROXY_URL = process.env.OAUTH_PROXY_URL || null;
 
 // 1일마다 실행 (30일 만료 대비 충분한 여유)
-const INTERVAL_MS = 24 * 60 * 60 * 1000;
+const INTERVAL_MS = 4 * 60 * 60 * 1000;
 
 // 요청 사이 딜레이 (rate limit 방지)
 const DELAY_MS = 800;
@@ -152,5 +152,5 @@ export function startTokenRefreshScheduler() {
     setInterval(runTokenRefresh, INTERVAL_MS);
   }, 2 * 60 * 1000);
 
-  console.log('[TokenRefresh] 스케줄러 등록 완료 (1일 주기)');
+  console.log('[TokenRefresh] 스케줄러 등록 완료 (4시간 주기)');
 }

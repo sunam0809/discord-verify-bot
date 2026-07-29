@@ -295,7 +295,7 @@ app.post('/api/verify-complete', verifySameOrigin, async (req, res) => {
       const joinRes = await axios.put(
         `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}`,
         { access_token: d.accessToken, roles: config.role_id ? [config.role_id] : [] },
-        { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 10000 }
       );
       console.log('[verify-complete] join status:', joinRes.status);
       // 204 = 이미 서버에 있음 -> roles 무시 -> 별도 역할 부여
@@ -303,7 +303,7 @@ app.post('/api/verify-complete', verifySameOrigin, async (req, res) => {
         await axios.put(
           `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}/roles/${config.role_id}`,
           {},
-          { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
+          { headers: { Authorization: `Bot ${BOT_TOKEN}` }, timeout: 8000 }
         ).catch(e2 => console.error('[verify-complete] role error (already in):', e2.response?.status, e2.message));
       }
     } catch(e) {
@@ -313,7 +313,7 @@ app.post('/api/verify-complete', verifySameOrigin, async (req, res) => {
           await axios.put(
             `https://discord.com/api/v10/guilds/${d.guild_id}/members/${d.userId}/roles/${config.role_id}`,
             {},
-            { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
+            { headers: { Authorization: `Bot ${BOT_TOKEN}` }, timeout: 8000 }
           );
         } catch(e2) { console.error('[verify-complete] role fallback error:', e2.response?.status, e2.message); }
       }

@@ -1,9 +1,17 @@
 import pg from 'pg';
 const { Pool } = pg;
 
+// max: 3 — 인스턴스 당 연결 수 제한 (Render 무료 DB 연결 풀 고갈 방지)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 3,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+pool.on('error', (err) => {
+  console.error('[Pool] Unexpected error:', err.message);
 });
 
 export async function query(text, params) {

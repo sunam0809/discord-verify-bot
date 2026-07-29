@@ -70,18 +70,35 @@ async function addMemberToGuild(guildId, userId, accessToken) {
   }
 }
 
-async function refreshAccessToken(refreshToken) {
+/**
+ * refresh_token으로 새 토큰 발급
+ * - invalid_grant → null (재인증 필요)
+ * - 네트워크/서버 오류 → 최대 3회 재시도 후 'transient' (기존 토큰 유지)
+ */
+async function refreshAccessToken(rt, attempt = 0) {
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 20_000;
   try {
-    // OAUTH_PROXY_URL이 설정된 경우 프록시 사용 (app.js와 동일하게)
     const endpoint = OAUTH_PROXY_URL || 'https://discord.com/api/oauth2/token';
     const res = await axios.post(endpoint,
-      new URLSearchParams({ client_id: APP_ID, client_secret: CLIENT_SECRET, grant_type: 'refresh_token', refresh_token: refreshToken }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 8000 }
+      new URLSearchParams({ client_id: APP_ID, client_secret: CLIENT_SECRET, grant_type: 'refresh_token', refresh_token: rt }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 12000 }
     );
     return { access_token: res.data.access_token, refresh_token: res.data.refresh_token, expires_in: res.data.expires_in };
   } catch(e) {
-    console.error('[refreshToken] FAILED:', e.response?.status, e.message);
-    return null;
+    const status = e.response?.status;
+    const errCode = e.response?.data?.error;
+    if ((status === 400 && errCode === 'invalid_grant') || status === 401) {
+      console.warn('[refreshToken] invalid_grant — 재인증 필요');
+      return null;
+    }
+    if (attempt < MAX_RETRIES - 1) {
+      console.warn(`[refreshToken] 일시적 오류 (status:${status}) — ${RETRY_DELAY/1000}s 후 재시도 (${attempt+1}/${MAX_RETRIES})`);
+      await new Promise(r => setTimeout(r, RETRY_DELAY));
+      return refreshAccessToken(rt, attempt + 1);
+    }
+    console.error('[refreshToken] 재시도 소진 (status:', status, e.message, ') — 기존 토큰으로 시도');
+    return 'transient';
   }
 }
 
@@ -275,7 +292,8 @@ export async function handleHttpInteraction(interaction, res) {
           await Promise.all(batch.map(async (user) => {
             if (!user.refresh_token) return;
             const refreshed = await refreshAccessToken(user.refresh_token);
-            if (refreshed) {
+            if (refreshed && refreshed !== 'transient') {
+              // 갱신 성공
               user.access_token = refreshed.access_token;
               user.refresh_token = refreshed.refresh_token;
               user._newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
@@ -284,7 +302,11 @@ export async function handleHttpInteraction(interaction, res) {
                 'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
                 [user.access_token, user.refresh_token, user._newExpiry, user.id]
               ).catch(() => {});
+            } else if (refreshed === null) {
+              // invalid_grant — 재인증 필요 (초대 실패 후 DM 흐름으로 넘어감)
+              user._tokenRevoked = true;
             }
+            // 'transient': 일시적 오류 — 기존 access_token으로 초대 시도
           }));
         }
 

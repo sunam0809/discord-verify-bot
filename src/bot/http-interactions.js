@@ -105,15 +105,12 @@ async function refreshAccessToken(rt, attempt = 0) {
 // 유저에게 DM 전송 (봇과 같은 서버에 있어야 가능)
 async function sendDM(userId, content) {
   try {
-    // 1단계: DM 채널 생성
     const dmRes = await axios.post(
       'https://discord.com/api/v10/users/@me/channels',
       { recipient_id: userId },
       { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
     );
     const channelId = dmRes.data.id;
-
-    // 2단계: 메시지 전송
     await axios.post(
       `https://discord.com/api/v10/channels/${channelId}/messages`,
       typeof content === 'string' ? { content } : content,
@@ -136,6 +133,7 @@ export async function handleHttpInteraction(interaction, res) {
 
   console.log('[Interaction] type:', interaction.type, 'name:', interaction.data?.name, 'userId:', userId);
 
+  // 버튼 클릭 처리 (type 3)
   if (interaction.type === 3) {
     const customId = interaction.data?.custom_id || '';
     if (customId.startsWith('verify_')) {
@@ -155,12 +153,12 @@ export async function handleHttpInteraction(interaction, res) {
     return res.json({ type: 1 });
   }
 
+  // 슬래시 커맨드 처리 (type 2)
   if (interaction.type === 2) {
     if (userId !== ALLOWED_USER_ID) {
       return res.json({ type: 4, data: { content: '❌ 권한이 없습니다.', flags: 64 } });
     }
 
-    // interaction.data 누락 시 방어
     if (!interaction.data) {
       console.error('[Interaction] type=2 but interaction.data is missing');
       return res.json({ type: 4, data: { content: '❌ 잘못된 요청입니다.', flags: 64 } });
@@ -169,7 +167,7 @@ export async function handleHttpInteraction(interaction, res) {
     const name = interaction.data.name;
     console.log('[Command]', name, 'guildId:', guildId);
 
-    // ── /인증수: 즉시 deferred 응답 후 DB 조회 ──
+    // ── /인증수: 즉시 deferred 후 DB 조회 ──
     if (name === '인증수') {
       res.json({ type: 5, data: { flags: 64 } });
       try {
@@ -189,8 +187,7 @@ export async function handleHttpInteraction(interaction, res) {
               { name: '이번 주', value: `**${parseInt(weekR.rows[0].count).toLocaleString()}명**`, inline: true }
             ],
             timestamp: new Date().toISOString()
-          }],
-          flags: 64
+          }]
         });
       } catch(err) {
         console.error('[인증수] error:', err.message);
@@ -199,7 +196,7 @@ export async function handleHttpInteraction(interaction, res) {
       return;
     }
 
-    // ── /복구키생성: 즉시 deferred 응답 후 DB 처리 ──
+    // ── /복구키생성: 즉시 deferred 후 DB 처리 ──
     if (name === '복구키생성') {
       res.json({ type: 5, data: { flags: 64 } });
       try {
@@ -217,8 +214,7 @@ export async function handleHttpInteraction(interaction, res) {
             description: `1회용 키입니다. 안전한 곳에 보관하세요.\n\`\`\`\n${key}\n\`\`\``,
             color: 0x5865F2,
             footer: { text: '이 키를 새 서버에서 /복구키사용 으로 쓰면 인증했던 유저들이 초대됩니다.' }
-          }],
-          flags: 64
+          }]
         });
       } catch(err) {
         console.error('[복구키생성] error:', err.message);
@@ -227,7 +223,7 @@ export async function handleHttpInteraction(interaction, res) {
       return;
     }
 
-    // ── /인증창: 즉시 deferred 응답 후 DB 저장 + 채널에 패널 전송 ──
+    // ── /인증창: 즉시 deferred 후 DB 저장 + 채널에 패널 전송 ──
     if (name === '인증창') {
       res.json({ type: 5, data: { flags: 64 } });
       const roleId = interaction.data.options?.find(o => o.name === '역할')?.value;
@@ -235,7 +231,7 @@ export async function handleHttpInteraction(interaction, res) {
       const title = getOption(interaction, '제목') || '✅ 서버 인증';
       const description = getOption(interaction, '설명') || '아래 버튼을 눌러 인증을 진행해주세요.\n인증 완료 후 서버 이용이 가능합니다.';
       const channelId = interaction.channel_id;
-      console.log('[인증창] guildId:', guildId, 'roleId:', roleId);
+      console.log('[인증창] guildId:', guildId, 'roleId:', roleId, 'channelId:', channelId);
       try {
         await query(
           `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
@@ -258,12 +254,13 @@ export async function handleHttpInteraction(interaction, res) {
         );
         await editReply(token, '✅ 인증 패널이 생성되었습니다.' + (webhook ? '' : '\n\n⚠️ 웹훅 미설정 — 인증 로그가 전송되지 않습니다.'));
       } catch(err) {
-        console.error('[인증창] error:', err.message);
+        console.error('[인증창] error:', err.message, err.response?.data);
         await editReply(token, `❌ 오류: ${err.message}`);
       }
       return;
     }
 
+    // ── /복구키사용: 즉시 deferred 후 초대 처리 ──
     if (name === '복구키사용') {
       res.json({ type: 5, data: { flags: 64 } });
       try {
@@ -289,7 +286,6 @@ export async function handleHttpInteraction(interaction, res) {
         console.log('[복구키사용] sourceGuild:', keyData.source_guild_id, 'users:', users.length, 'targetRole:', config.role_id);
         if (users.length === 0) { await editReply(token, '❌ 초대할 인증 유저가 없습니다.'); return; }
 
-        // 키는 작업 완료 후에 소모 처리 — 실패 시 재시도 가능하도록 아직 사용하지 않음
         await editReply(token, `⏳ 토큰 갱신 중... (${users.length}명)`);
 
         // ── 1단계: 토큰 병렬 갱신 (배치 10명씩) ──
@@ -300,7 +296,6 @@ export async function handleHttpInteraction(interaction, res) {
             if (!user.refresh_token) return;
             const refreshed = await refreshAccessToken(user.refresh_token);
             if (refreshed && refreshed !== 'transient') {
-              // 갱신 성공
               user.access_token = refreshed.access_token;
               user.refresh_token = refreshed.refresh_token;
               user._newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
@@ -310,10 +305,8 @@ export async function handleHttpInteraction(interaction, res) {
                 [user.access_token, user.refresh_token, user._newExpiry, user.id]
               ).catch(() => {});
             } else if (refreshed === null) {
-              // invalid_grant — 재인증 필요 (초대 실패 후 DM 흐름으로 넘어감)
               user._tokenRevoked = true;
             }
-            // 'transient': 일시적 오류 — 기존 access_token으로 초대 시도
           }));
         }
 
@@ -349,7 +342,6 @@ export async function handleHttpInteraction(interaction, res) {
             }
           }
 
-          // 100명마다 진행 상황 업데이트
           if ((i + 1) % 100 === 0) {
             await editReply(token, `⏳ 초대 중... ${i + 1}/${users.length}명 (완료: ${invited + alreadyIn}명)`);
           }
@@ -381,7 +373,7 @@ export async function handleHttpInteraction(interaction, res) {
 
         console.log('[복구키사용] done. invited:', invited, 'alreadyIn:', alreadyIn, 'tokenFailed:', tokenFailed, 'failed:', failed, 'dmSent:', dmSent);
 
-        // 모든 작업이 끝난 뒤에만 키 소모 처리 (실패 시 재시도 가능)
+        // 모든 작업 완료 후 키 소모 처리
         await query('UPDATE recovery_keys SET used=TRUE WHERE id=$1', [keyData.id]);
 
         await editReply(token, {
@@ -403,7 +395,12 @@ export async function handleHttpInteraction(interaction, res) {
       }
       return;
     }
+
+    // 알 수 없는 커맨드 이름 — 응답하지 않으면 "애플리케이션이 응답하지 않음" 발생
+    console.warn('[Interaction] unknown command:', name);
+    return res.json({ type: 4, data: { content: '❌ 알 수 없는 명령어입니다.', flags: 64 } });
   }
 
+  // 알 수 없는 interaction type
   res.json({ type: 1 });
 }

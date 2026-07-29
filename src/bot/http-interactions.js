@@ -169,7 +169,9 @@ export async function handleHttpInteraction(interaction, res) {
     const name = interaction.data.name;
     console.log('[Command]', name, 'guildId:', guildId);
 
+    // ── /인증수: 즉시 deferred 응답 후 DB 조회 ──
     if (name === '인증수') {
+      res.json({ type: 5, data: { flags: 64 } });
       try {
         const [totalR, todayR, weekR] = await Promise.all([
           query('SELECT COUNT(*) FROM verified_users WHERE guild_id=$1', [guildId]),
@@ -178,55 +180,56 @@ export async function handleHttpInteraction(interaction, res) {
         ]);
         const total = parseInt(totalR.rows[0].count);
         console.log('[인증수] guild:', guildId, 'total:', total);
-        return res.json({
-          type: 4,
-          data: {
-            embeds: [{
-              title: '📊 인증 현황', color: 0x5865F2,
-              fields: [
-                { name: '전체', value: `**${total.toLocaleString()}명**`, inline: true },
-                { name: '오늘', value: `**${parseInt(todayR.rows[0].count).toLocaleString()}명**`, inline: true },
-                { name: '이번 주', value: `**${parseInt(weekR.rows[0].count).toLocaleString()}명**`, inline: true }
-              ],
-              timestamp: new Date().toISOString()
-            }],
-            flags: 64
-          }
+        await editReply(token, {
+          embeds: [{
+            title: '📊 인증 현황', color: 0x5865F2,
+            fields: [
+              { name: '전체', value: `**${total.toLocaleString()}명**`, inline: true },
+              { name: '오늘', value: `**${parseInt(todayR.rows[0].count).toLocaleString()}명**`, inline: true },
+              { name: '이번 주', value: `**${parseInt(weekR.rows[0].count).toLocaleString()}명**`, inline: true }
+            ],
+            timestamp: new Date().toISOString()
+          }],
+          flags: 64
         });
       } catch(err) {
         console.error('[인증수] error:', err.message);
-        return res.json({ type: 4, data: { content: `❌ 오류: ${err.message}`, flags: 64 } });
+        await editReply(token, `❌ 오류: ${err.message}`);
       }
+      return;
     }
 
+    // ── /복구키생성: 즉시 deferred 응답 후 DB 처리 ──
     if (name === '복구키생성') {
+      res.json({ type: 5, data: { flags: 64 } });
       try {
         const cfg = await query('SELECT guild_id FROM server_configs WHERE guild_id=$1', [guildId]);
         if (cfg.rows.length === 0) {
-          return res.json({ type: 4, data: { content: '❌ 먼저 /인증창 으로 설정해주세요.', flags: 64 } });
+          await editReply(token, '❌ 먼저 /인증창 으로 설정해주세요.');
+          return;
         }
         const key = randomBytes(16).toString('hex').toUpperCase().match(/.{4}/g).join('-');
         await query('INSERT INTO recovery_keys (recovery_key, source_guild_id) VALUES ($1,$2)', [key, guildId]);
         console.log('[복구키생성] key created for guild:', guildId);
-        return res.json({
-          type: 4,
-          data: {
-            embeds: [{
-              title: '🔑 복구 키 생성 완료',
-              description: `1회용 키입니다. 안전한 곳에 보관하세요.\n\`\`\`\n${key}\n\`\`\``,
-              color: 0x5865F2,
-              footer: { text: '이 키를 새 서버에서 /복구키사용 으로 쓰면 인증했던 유저들이 초대됩니다.' }
-            }],
-            flags: 64
-          }
+        await editReply(token, {
+          embeds: [{
+            title: '🔑 복구 키 생성 완료',
+            description: `1회용 키입니다. 안전한 곳에 보관하세요.\n\`\`\`\n${key}\n\`\`\``,
+            color: 0x5865F2,
+            footer: { text: '이 키를 새 서버에서 /복구키사용 으로 쓰면 인증했던 유저들이 초대됩니다.' }
+          }],
+          flags: 64
         });
       } catch(err) {
         console.error('[복구키생성] error:', err.message);
-        return res.json({ type: 4, data: { content: `❌ 오류: ${err.message}`, flags: 64 } });
+        await editReply(token, `❌ 오류: ${err.message}`);
       }
+      return;
     }
 
+    // ── /인증창: 즉시 deferred 응답 후 DB 저장 + 채널에 패널 전송 ──
     if (name === '인증창') {
+      res.json({ type: 5, data: { flags: 64 } });
       const roleId = interaction.data.options?.find(o => o.name === '역할')?.value;
       const webhook = getOption(interaction, '웹훅') || null;
       const title = getOption(interaction, '제목') || '✅ 서버 인증';
@@ -241,20 +244,24 @@ export async function handleHttpInteraction(interaction, res) {
            SET role_id=$2, webhook_url=$3, panel_title=$4, panel_description=$5, channel_id=$6`,
           [guildId, roleId, webhook, title, description, channelId]
         );
+        // 채널에 인증 패널 메시지 직접 전송
+        await axios.post(
+          `https://discord.com/api/v10/channels/${channelId}/messages`,
+          {
+            embeds: [{ title, description, color: 0x5865F2, timestamp: new Date().toISOString() }],
+            components: [{
+              type: 1,
+              components: [{ type: 2, style: 1, label: '인증하기', custom_id: `verify_${guildId}`, emoji: { name: '🛡️' } }]
+            }]
+          },
+          { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
+        );
+        await editReply(token, '✅ 인증 패널이 생성되었습니다.' + (webhook ? '' : '\n\n⚠️ 웹훅 미설정 — 인증 로그가 전송되지 않습니다.'));
       } catch(err) {
-        console.error('[인증창] DB error:', err.message);
-        return res.json({ type: 4, data: { content: `❌ 설정 저장 실패: ${err.message}`, flags: 64 } });
+        console.error('[인증창] error:', err.message);
+        await editReply(token, `❌ 오류: ${err.message}`);
       }
-      return res.json({
-        type: 4,
-        data: {
-          embeds: [{ title, description, color: 0x5865F2, timestamp: new Date().toISOString() }],
-          components: [{
-            type: 1,
-            components: [{ type: 2, style: 1, label: '인증하기', custom_id: `verify_${guildId}`, emoji: { name: '🛡️' } }]
-          }]
-        }
-      });
+      return;
     }
 
     if (name === '복구키사용') {

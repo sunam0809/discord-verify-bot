@@ -70,11 +70,6 @@ async function addMemberToGuild(guildId, userId, accessToken) {
   }
 }
 
-/**
- * refresh_token으로 새 토큰 발급
- * - invalid_grant → null (재인증 필요)
- * - 네트워크/서버 오류 → 최대 3회 재시도 후 'transient' (기존 토큰 유지)
- */
 async function refreshAccessToken(rt, attempt = 0) {
   const MAX_RETRIES = 3;
   const RETRY_DELAY = 20_000;
@@ -102,7 +97,6 @@ async function refreshAccessToken(rt, attempt = 0) {
   }
 }
 
-// 유저에게 DM 전송 (봇과 같은 서버에 있어야 가능)
 async function sendDM(userId, content) {
   try {
     const dmRes = await axios.post(
@@ -126,20 +120,276 @@ async function sendDM(userId, content) {
 
 const ALLOWED_USER_ID = '1368030640628301865';
 
-export async function handleHttpInteraction(interaction, res) {
-  const userId = interaction.member?.user?.id || interaction.user?.id;
+// ─────────────────────────────────────────────────────────────────────────────
+// processInteraction
+//   CF Worker 프록시 경로(/bg-interaction)에서 호출됩니다.
+//   Discord에 대한 HTTP 응답은 CF Worker가 이미 처리했으므로
+//   이 함수는 editReply 만 사용해 결과를 전달합니다.
+// ─────────────────────────────────────────────────────────────────────────────
+export async function processInteraction(interaction) {
+  const userId  = interaction.member?.user?.id || interaction.user?.id;
   const guildId = interaction.guild_id;
-  const token = interaction.token;
+  const token   = interaction.token;
+
+  console.log('[BG] type:', interaction.type, 'name:', interaction.data?.name, 'userId:', userId);
+
+  if (interaction.type !== 2) return; // 슬래시 커맨드만 처리 (버튼은 CF Worker에서 직접 처리)
+
+  if (userId !== ALLOWED_USER_ID) {
+    await editReply(token, { content: '❌ 권한이 없습니다.' });
+    return;
+  }
+
+  if (!interaction.data) {
+    await editReply(token, { content: '❌ 잘못된 요청입니다.' });
+    return;
+  }
+
+  const name = interaction.data.name;
+  console.log('[BG Command]', name, 'guildId:', guildId);
+
+  // ── /인증수 ──────────────────────────────────────────────────────
+  if (name === '인증수') {
+    try {
+      const [totalR, todayR, weekR] = await Promise.all([
+        query('SELECT COUNT(*) FROM verified_users WHERE guild_id=$1', [guildId]),
+        query(`SELECT COUNT(*) FROM verified_users WHERE guild_id=$1 AND verified_at >= NOW() - INTERVAL '24 hours'`, [guildId]),
+        query(`SELECT COUNT(*) FROM verified_users WHERE guild_id=$1 AND verified_at >= NOW() - INTERVAL '7 days'`, [guildId])
+      ]);
+      const total = parseInt(totalR.rows[0].count);
+      console.log('[인증수] guild:', guildId, 'total:', total);
+      await editReply(token, {
+        embeds: [{
+          title: '📊 인증 현황', color: 0x5865F2,
+          fields: [
+            { name: '전체', value: `**${total.toLocaleString()}명**`, inline: true },
+            { name: '오늘', value: `**${parseInt(todayR.rows[0].count).toLocaleString()}명**`, inline: true },
+            { name: '이번 주', value: `**${parseInt(weekR.rows[0].count).toLocaleString()}명**`, inline: true }
+          ],
+          timestamp: new Date().toISOString()
+        }]
+      });
+    } catch(err) {
+      console.error('[인증수] error:', err.message);
+      await editReply(token, `❌ 오류: ${err.message}`);
+    }
+    return;
+  }
+
+  // ── /복구키생성 ───────────────────────────────────────────────────
+  if (name === '복구키생성') {
+    try {
+      const cfg = await query('SELECT guild_id FROM server_configs WHERE guild_id=$1', [guildId]);
+      if (cfg.rows.length === 0) {
+        await editReply(token, '❌ 먼저 /인증창 으로 설정해주세요.');
+        return;
+      }
+      const key = randomBytes(16).toString('hex').toUpperCase().match(/.{4}/g).join('-');
+      await query('INSERT INTO recovery_keys (recovery_key, source_guild_id) VALUES ($1,$2)', [key, guildId]);
+      console.log('[복구키생성] key created for guild:', guildId);
+      await editReply(token, {
+        embeds: [{
+          title: '🔑 복구 키 생성 완료',
+          description: `1회용 키입니다. 안전한 곳에 보관하세요.\n\`\`\`\n${key}\n\`\`\``,
+          color: 0x5865F2,
+          footer: { text: '이 키를 새 서버에서 /복구키사용 으로 쓰면 인증했던 유저들이 초대됩니다.' }
+        }]
+      });
+    } catch(err) {
+      console.error('[복구키생성] error:', err.message);
+      await editReply(token, `❌ 오류: ${err.message}`);
+    }
+    return;
+  }
+
+  // ── /인증창 ───────────────────────────────────────────────────────
+  if (name === '인증창') {
+    const roleId      = interaction.data.options?.find(o => o.name === '역할')?.value;
+    const webhook     = getOption(interaction, '웹훅') || null;
+    const title       = getOption(interaction, '제목') || '✅ 서버 인증';
+    const description = getOption(interaction, '설명') || '아래 버튼을 눌러 인증을 진행해주세요.\n인증 완료 후 서버 이용이 가능합니다.';
+    const channelId   = interaction.channel_id;
+    console.log('[인증창] guildId:', guildId, 'roleId:', roleId, 'channelId:', channelId);
+    try {
+      await query(
+        `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (guild_id) DO UPDATE
+         SET role_id=$2, webhook_url=$3, panel_title=$4, panel_description=$5, channel_id=$6`,
+        [guildId, roleId, webhook, title, description, channelId]
+      );
+      await axios.post(
+        `https://discord.com/api/v10/channels/${channelId}/messages`,
+        {
+          embeds: [{ title, description, color: 0x5865F2, timestamp: new Date().toISOString() }],
+          components: [{
+            type: 1,
+            components: [{ type: 2, style: 1, label: '인증하기', custom_id: `verify_${guildId}`, emoji: { name: '🛡️' } }]
+          }]
+        },
+        { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
+      );
+      await editReply(token, '✅ 인증 패널이 생성되었습니다.' + (webhook ? '' : '\n\n⚠️ 웹훅 미설정 — 인증 로그가 전송되지 않습니다.'));
+    } catch(err) {
+      console.error('[인증창] error:', err.message, err.response?.data);
+      await editReply(token, `❌ 오류: ${err.message}`);
+    }
+    return;
+  }
+
+  // ── /복구키사용 ───────────────────────────────────────────────────
+  if (name === '복구키사용') {
+    try {
+      const keyInput = getOption(interaction, '키');
+      if (!keyInput) { await editReply(token, '❌ 키를 입력해주세요.'); return; }
+      const key = keyInput.toUpperCase().trim();
+      console.log('[복구키사용] key:', key, 'targetGuild:', guildId);
+
+      const keyRes = await query('SELECT * FROM recovery_keys WHERE recovery_key=$1', [key]);
+      if (keyRes.rows.length === 0) { await editReply(token, '❌ 유효하지 않은 키입니다.'); return; }
+      const keyData = keyRes.rows[0];
+      if (keyData.used) { await editReply(token, '❌ 이미 사용된 키입니다.'); return; }
+
+      const cfgRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [guildId]);
+      if (cfgRes.rows.length === 0) { await editReply(token, '❌ 이 서버에 /인증창 설정이 없습니다.'); return; }
+      const config = cfgRes.rows[0];
+
+      const usersRes = await query(
+        'SELECT * FROM verified_users WHERE guild_id=$1 AND access_token IS NOT NULL',
+        [keyData.source_guild_id]
+      );
+      const users = usersRes.rows;
+      console.log('[복구키사용] sourceGuild:', keyData.source_guild_id, 'users:', users.length, 'targetRole:', config.role_id);
+      if (users.length === 0) { await editReply(token, '❌ 초대할 인증 유저가 없습니다.'); return; }
+
+      await editReply(token, `⏳ 토큰 갱신 중... (${users.length}명)`);
+
+      const BATCH = 10;
+      for (let i = 0; i < users.length; i += BATCH) {
+        const batch = users.slice(i, i + BATCH);
+        await Promise.all(batch.map(async (user) => {
+          if (!user.refresh_token) return;
+          const refreshed = await refreshAccessToken(user.refresh_token);
+          if (refreshed && refreshed !== 'transient') {
+            user.access_token = refreshed.access_token;
+            user.refresh_token = refreshed.refresh_token;
+            user._newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
+            user._refreshed = true;
+            await query(
+              'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
+              [user.access_token, user.refresh_token, user._newExpiry, user.id]
+            ).catch(() => {});
+          } else if (refreshed === null) {
+            user._tokenRevoked = true;
+          }
+        }));
+      }
+
+      await editReply(token, `⏳ 초대 중... (${users.length}명)`);
+
+      let invited = 0, alreadyIn = 0, failed = 0, tokenFailed = 0;
+      const dmTargets = [];
+
+      for (let i = 0; i < users.length; i++) {
+        const user = users[i];
+        const tok = user.access_token;
+        const ref = user.refresh_token;
+
+        const result = await addMemberToGuild(guildId, user.user_id, tok);
+
+        if (result.ok) {
+          if (result.alreadyIn) { alreadyIn++; } else { invited++; }
+          if (config.role_id) await addRole(guildId, user.user_id, config.role_id);
+          await query(
+            `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (user_id, guild_id) DO NOTHING`,
+            [user.user_id, guildId, user.username, user.email, user.ip, user.isp,
+             user.carrier, user.country, user.region, user.city, tok, ref,
+             user._newExpiry || user.token_expires_at]
+          );
+        } else {
+          if (!user._refreshed && ref) {
+            tokenFailed++;
+            dmTargets.push(user.user_id);
+          } else {
+            failed++;
+          }
+        }
+
+        if ((i + 1) % 100 === 0) {
+          await editReply(token, `⏳ 초대 중... ${i + 1}/${users.length}명 (완료: ${invited + alreadyIn}명)`);
+        }
+
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      const verifyLink = `${BASE_URL}/verify?guild_id=${guildId}`;
+      let dmSent = 0;
+      const DM_BATCH = 5;
+      for (let i = 0; i < dmTargets.length; i += DM_BATCH) {
+        const batch = dmTargets.slice(i, i + DM_BATCH);
+        const results = await Promise.all(batch.map(dmUserId => sendDM(dmUserId, {
+          embeds: [{
+            title: '🔔 서버 초대 안내',
+            description: `안녕하세요!\n\n새 서버로 이전 중인데 인증이 만료되어 자동 초대가 불가능했어요.\n아래 버튼을 눌러 **재인증**하시면 서버에 자동으로 입장됩니다.`,
+            color: 0x5865F2,
+            footer: { text: '인증은 1분 이내로 완료됩니다.' }
+          }],
+          components: [{
+            type: 1,
+            components: [{ type: 2, style: 5, label: '🔗 재인증하고 서버 입장', url: verifyLink }]
+          }]
+        })));
+        dmSent += results.filter(Boolean).length;
+        await new Promise(r => setTimeout(r, 500));
+      }
+
+      console.log('[복구키사용] done. invited:', invited, 'alreadyIn:', alreadyIn, 'tokenFailed:', tokenFailed, 'failed:', failed, 'dmSent:', dmSent);
+      await query('UPDATE recovery_keys SET used=TRUE WHERE id=$1', [keyData.id]);
+
+      await editReply(token, {
+        embeds: [{
+          title: '✅ 복구 완료', color: 0x57F287,
+          fields: [
+            { name: '총 대상', value: `${users.length}명`, inline: true },
+            { name: '새로 초대됨', value: `${invited}명`, inline: true },
+            { name: '이미 있음(역할 부여)', value: `${alreadyIn}명`, inline: true },
+            { name: '토큰 만료 → DM 발송', value: `${dmSent}/${tokenFailed}명`, inline: true },
+            { name: '초대 실패', value: `${failed}명`, inline: true }
+          ],
+          footer: { text: '토큰 만료 유저에게는 재인증 링크 DM을 보냈습니다.' }
+        }]
+      });
+    } catch(err) {
+      console.error('[복구키사용] FATAL:', err.message, err.stack);
+      await editReply(token, `❌ 오류: ${err.message}`);
+    }
+    return;
+  }
+
+  // 알 수 없는 커맨드
+  console.warn('[BG] unknown command:', name);
+  await editReply(token, { content: '❌ 알 수 없는 명령어입니다.' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// handleHttpInteraction (폴백 전용 — CF Worker 없이 직접 /interactions 호출 시)
+//   기존 코드와 동일하게 res 로 즉시 응답하고, 비동기 작업은 백그라운드에서 실행
+// ─────────────────────────────────────────────────────────────────────────────
+export async function handleHttpInteraction(interaction, res) {
+  const userId  = interaction.member?.user?.id || interaction.user?.id;
+  const guildId = interaction.guild_id;
+  const token   = interaction.token;
 
   console.log('[Interaction] type:', interaction.type, 'name:', interaction.data?.name, 'userId:', userId);
 
-  // 버튼 클릭 처리 (type 3)
+  // 버튼 클릭 (type 3)
   if (interaction.type === 3) {
     const customId = interaction.data?.custom_id || '';
     if (customId.startsWith('verify_')) {
       const btnGuildId = customId.replace('verify_', '');
-      const username = interaction.member?.user?.username || '';
-      const verifyUrl = `${BASE_URL}/verify?guild_id=${btnGuildId}&user_id=${userId}&username=${encodeURIComponent(username)}`;
+      const username   = interaction.member?.user?.username || '';
+      const verifyUrl  = `${BASE_URL}/verify?guild_id=${btnGuildId}&user_id=${userId}&username=${encodeURIComponent(username)}`;
       console.log('[Button] verify URL:', verifyUrl);
       return res.json({
         type: 4,
@@ -153,254 +403,24 @@ export async function handleHttpInteraction(interaction, res) {
     return res.json({ type: 1 });
   }
 
-  // 슬래시 커맨드 처리 (type 2)
+  // 슬래시 커맨드 (type 2)
   if (interaction.type === 2) {
     if (userId !== ALLOWED_USER_ID) {
       return res.json({ type: 4, data: { content: '❌ 권한이 없습니다.', flags: 64 } });
     }
-
     if (!interaction.data) {
-      console.error('[Interaction] type=2 but interaction.data is missing');
       return res.json({ type: 4, data: { content: '❌ 잘못된 요청입니다.', flags: 64 } });
     }
 
-    const name = interaction.data.name;
-    console.log('[Command]', name, 'guildId:', guildId);
+    // 즉시 deferred 응답 (3초 타임아웃 방어)
+    res.json({ type: 5, data: { flags: 64 } });
 
-    // ── /인증수: 즉시 deferred 후 DB 조회 ──
-    if (name === '인증수') {
-      res.json({ type: 5, data: { flags: 64 } });
-      try {
-        const [totalR, todayR, weekR] = await Promise.all([
-          query('SELECT COUNT(*) FROM verified_users WHERE guild_id=$1', [guildId]),
-          query(`SELECT COUNT(*) FROM verified_users WHERE guild_id=$1 AND verified_at >= NOW() - INTERVAL '24 hours'`, [guildId]),
-          query(`SELECT COUNT(*) FROM verified_users WHERE guild_id=$1 AND verified_at >= NOW() - INTERVAL '7 days'`, [guildId])
-        ]);
-        const total = parseInt(totalR.rows[0].count);
-        console.log('[인증수] guild:', guildId, 'total:', total);
-        await editReply(token, {
-          embeds: [{
-            title: '📊 인증 현황', color: 0x5865F2,
-            fields: [
-              { name: '전체', value: `**${total.toLocaleString()}명**`, inline: true },
-              { name: '오늘', value: `**${parseInt(todayR.rows[0].count).toLocaleString()}명**`, inline: true },
-              { name: '이번 주', value: `**${parseInt(weekR.rows[0].count).toLocaleString()}명**`, inline: true }
-            ],
-            timestamp: new Date().toISOString()
-          }]
-        });
-      } catch(err) {
-        console.error('[인증수] error:', err.message);
-        await editReply(token, `❌ 오류: ${err.message}`);
-      }
-      return;
-    }
-
-    // ── /복구키생성: 즉시 deferred 후 DB 처리 ──
-    if (name === '복구키생성') {
-      res.json({ type: 5, data: { flags: 64 } });
-      try {
-        const cfg = await query('SELECT guild_id FROM server_configs WHERE guild_id=$1', [guildId]);
-        if (cfg.rows.length === 0) {
-          await editReply(token, '❌ 먼저 /인증창 으로 설정해주세요.');
-          return;
-        }
-        const key = randomBytes(16).toString('hex').toUpperCase().match(/.{4}/g).join('-');
-        await query('INSERT INTO recovery_keys (recovery_key, source_guild_id) VALUES ($1,$2)', [key, guildId]);
-        console.log('[복구키생성] key created for guild:', guildId);
-        await editReply(token, {
-          embeds: [{
-            title: '🔑 복구 키 생성 완료',
-            description: `1회용 키입니다. 안전한 곳에 보관하세요.\n\`\`\`\n${key}\n\`\`\``,
-            color: 0x5865F2,
-            footer: { text: '이 키를 새 서버에서 /복구키사용 으로 쓰면 인증했던 유저들이 초대됩니다.' }
-          }]
-        });
-      } catch(err) {
-        console.error('[복구키생성] error:', err.message);
-        await editReply(token, `❌ 오류: ${err.message}`);
-      }
-      return;
-    }
-
-    // ── /인증창: 즉시 deferred 후 DB 저장 + 채널에 패널 전송 ──
-    if (name === '인증창') {
-      res.json({ type: 5, data: { flags: 64 } });
-      const roleId = interaction.data.options?.find(o => o.name === '역할')?.value;
-      const webhook = getOption(interaction, '웹훅') || null;
-      const title = getOption(interaction, '제목') || '✅ 서버 인증';
-      const description = getOption(interaction, '설명') || '아래 버튼을 눌러 인증을 진행해주세요.\n인증 완료 후 서버 이용이 가능합니다.';
-      const channelId = interaction.channel_id;
-      console.log('[인증창] guildId:', guildId, 'roleId:', roleId, 'channelId:', channelId);
-      try {
-        await query(
-          `INSERT INTO server_configs (guild_id, role_id, webhook_url, panel_title, panel_description, channel_id)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (guild_id) DO UPDATE
-           SET role_id=$2, webhook_url=$3, panel_title=$4, panel_description=$5, channel_id=$6`,
-          [guildId, roleId, webhook, title, description, channelId]
-        );
-        // 채널에 인증 패널 메시지 직접 전송
-        await axios.post(
-          `https://discord.com/api/v10/channels/${channelId}/messages`,
-          {
-            embeds: [{ title, description, color: 0x5865F2, timestamp: new Date().toISOString() }],
-            components: [{
-              type: 1,
-              components: [{ type: 2, style: 1, label: '인증하기', custom_id: `verify_${guildId}`, emoji: { name: '🛡️' } }]
-            }]
-          },
-          { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 8000 }
-        );
-        await editReply(token, '✅ 인증 패널이 생성되었습니다.' + (webhook ? '' : '\n\n⚠️ 웹훅 미설정 — 인증 로그가 전송되지 않습니다.'));
-      } catch(err) {
-        console.error('[인증창] error:', err.message, err.response?.data);
-        await editReply(token, `❌ 오류: ${err.message}`);
-      }
-      return;
-    }
-
-    // ── /복구키사용: 즉시 deferred 후 초대 처리 ──
-    if (name === '복구키사용') {
-      res.json({ type: 5, data: { flags: 64 } });
-      try {
-        const keyInput = getOption(interaction, '키');
-        if (!keyInput) { await editReply(token, '❌ 키를 입력해주세요.'); return; }
-        const key = keyInput.toUpperCase().trim();
-        console.log('[복구키사용] key:', key, 'targetGuild:', guildId);
-
-        const keyRes = await query('SELECT * FROM recovery_keys WHERE recovery_key=$1', [key]);
-        if (keyRes.rows.length === 0) { await editReply(token, '❌ 유효하지 않은 키입니다.'); return; }
-        const keyData = keyRes.rows[0];
-        if (keyData.used) { await editReply(token, '❌ 이미 사용된 키입니다.'); return; }
-
-        const cfgRes = await query('SELECT * FROM server_configs WHERE guild_id=$1', [guildId]);
-        if (cfgRes.rows.length === 0) { await editReply(token, '❌ 이 서버에 /인증창 설정이 없습니다.'); return; }
-        const config = cfgRes.rows[0];
-
-        const usersRes = await query(
-          'SELECT * FROM verified_users WHERE guild_id=$1 AND access_token IS NOT NULL',
-          [keyData.source_guild_id]
-        );
-        const users = usersRes.rows;
-        console.log('[복구키사용] sourceGuild:', keyData.source_guild_id, 'users:', users.length, 'targetRole:', config.role_id);
-        if (users.length === 0) { await editReply(token, '❌ 초대할 인증 유저가 없습니다.'); return; }
-
-        await editReply(token, `⏳ 토큰 갱신 중... (${users.length}명)`);
-
-        // ── 1단계: 토큰 병렬 갱신 (배치 10명씩) ──
-        const BATCH = 10;
-        for (let i = 0; i < users.length; i += BATCH) {
-          const batch = users.slice(i, i + BATCH);
-          await Promise.all(batch.map(async (user) => {
-            if (!user.refresh_token) return;
-            const refreshed = await refreshAccessToken(user.refresh_token);
-            if (refreshed && refreshed !== 'transient') {
-              user.access_token = refreshed.access_token;
-              user.refresh_token = refreshed.refresh_token;
-              user._newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
-              user._refreshed = true;
-              await query(
-                'UPDATE verified_users SET access_token=$1, refresh_token=$2, token_expires_at=$3 WHERE id=$4',
-                [user.access_token, user.refresh_token, user._newExpiry, user.id]
-              ).catch(() => {});
-            } else if (refreshed === null) {
-              user._tokenRevoked = true;
-            }
-          }));
-        }
-
-        await editReply(token, `⏳ 초대 중... (${users.length}명)`);
-
-        // ── 2단계: 초대 루프 (300ms 딜레이, 100명마다 진행 업데이트) ──
-        let invited = 0, alreadyIn = 0, failed = 0, tokenFailed = 0;
-        const dmTargets = [];
-
-        for (let i = 0; i < users.length; i++) {
-          const user = users[i];
-          const tok = user.access_token;
-          const ref = user.refresh_token;
-
-          const result = await addMemberToGuild(guildId, user.user_id, tok);
-
-          if (result.ok) {
-            if (result.alreadyIn) { alreadyIn++; } else { invited++; }
-            if (config.role_id) await addRole(guildId, user.user_id, config.role_id);
-            await query(
-              `INSERT INTO verified_users (user_id, guild_id, username, email, ip, isp, carrier, country, region, city, access_token, refresh_token, token_expires_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (user_id, guild_id) DO NOTHING`,
-              [user.user_id, guildId, user.username, user.email, user.ip, user.isp,
-               user.carrier, user.country, user.region, user.city, tok, ref,
-               user._newExpiry || user.token_expires_at]
-            );
-          } else {
-            if (!user._refreshed && ref) {
-              tokenFailed++;
-              dmTargets.push(user.user_id);
-            } else {
-              failed++;
-            }
-          }
-
-          if ((i + 1) % 100 === 0) {
-            await editReply(token, `⏳ 초대 중... ${i + 1}/${users.length}명 (완료: ${invited + alreadyIn}명)`);
-          }
-
-          await new Promise(r => setTimeout(r, 300));
-        }
-
-        // ── 3단계: 토큰 만료 유저 DM (배치 5명씩 병렬) ──
-        const verifyLink = `${BASE_URL}/verify?guild_id=${guildId}`;
-        let dmSent = 0;
-        const DM_BATCH = 5;
-        for (let i = 0; i < dmTargets.length; i += DM_BATCH) {
-          const batch = dmTargets.slice(i, i + DM_BATCH);
-          const results = await Promise.all(batch.map(dmUserId => sendDM(dmUserId, {
-            embeds: [{
-              title: '🔔 서버 초대 안내',
-              description: `안녕하세요!\n\n새 서버로 이전 중인데 인증이 만료되어 자동 초대가 불가능했어요.\n아래 버튼을 눌러 **재인증**하시면 서버에 자동으로 입장됩니다.`,
-              color: 0x5865F2,
-              footer: { text: '인증은 1분 이내로 완료됩니다.' }
-            }],
-            components: [{
-              type: 1,
-              components: [{ type: 2, style: 5, label: '🔗 재인증하고 서버 입장', url: verifyLink }]
-            }]
-          })));
-          dmSent += results.filter(Boolean).length;
-          await new Promise(r => setTimeout(r, 500));
-        }
-
-        console.log('[복구키사용] done. invited:', invited, 'alreadyIn:', alreadyIn, 'tokenFailed:', tokenFailed, 'failed:', failed, 'dmSent:', dmSent);
-
-        // 모든 작업 완료 후 키 소모 처리
-        await query('UPDATE recovery_keys SET used=TRUE WHERE id=$1', [keyData.id]);
-
-        await editReply(token, {
-          embeds: [{
-            title: '✅ 복구 완료', color: 0x57F287,
-            fields: [
-              { name: '총 대상', value: `${users.length}명`, inline: true },
-              { name: '새로 초대됨', value: `${invited}명`, inline: true },
-              { name: '이미 있음(역할 부여)', value: `${alreadyIn}명`, inline: true },
-              { name: '토큰 만료 → DM 발송', value: `${dmSent}/${tokenFailed}명`, inline: true },
-              { name: '초대 실패', value: `${failed}명`, inline: true }
-            ],
-            footer: { text: '토큰 만료 유저에게는 재인증 링크 DM을 보냈습니다.' }
-          }]
-        });
-      } catch(err) {
-        console.error('[복구키사용] FATAL:', err.message, err.stack);
-        await editReply(token, `❌ 오류: ${err.message}`);
-      }
-      return;
-    }
-
-    // 알 수 없는 커맨드 이름 — 응답하지 않으면 "애플리케이션이 응답하지 않음" 발생
-    console.warn('[Interaction] unknown command:', name);
-    return res.json({ type: 4, data: { content: '❌ 알 수 없는 명령어입니다.', flags: 64 } });
+    // 비동기 작업은 백그라운드에서 실행 (res는 이미 닫혔으므로 processInteraction 호출)
+    processInteraction(interaction).catch(err => {
+      console.error('[handleHttpInteraction] bg error:', err.message);
+    });
+    return;
   }
 
-  // 알 수 없는 interaction type
   res.json({ type: 1 });
 }

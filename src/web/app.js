@@ -6,16 +6,18 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import nacl from 'tweetnacl';
 import { query } from '../db/index.js';
-import { handleHttpInteraction } from '../bot/http-interactions.js';
+import { handleHttpInteraction, processInteraction } from '../bot/http-interactions.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
-const PUBLIC_KEY = process.env.PUBLIC_KEY || '';
+const PUBLIC_KEY    = process.env.PUBLIC_KEY    || '';
+const WORKER_SECRET = process.env.WORKER_SECRET || '';
 
+// ── /interactions: Discord 직접 호출 폴백 (CF Worker 미사용 시) ──────────────
 app.post('/interactions', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['x-signature-ed25519'];
-  const ts = req.headers['x-signature-timestamp'];
+  const sig  = req.headers['x-signature-ed25519'];
+  const ts   = req.headers['x-signature-timestamp'];
   const body = req.body;
   try {
     const valid = nacl.sign.detached.verify(
@@ -30,6 +32,26 @@ app.post('/interactions', express.raw({ type: 'application/json' }), async (req,
   const interaction = JSON.parse(body);
   if (interaction.type === 1) return res.json({ type: 1 });
   await handleHttpInteraction(interaction, res);
+});
+
+// ── /bg-interaction: CF Worker 백그라운드 호출 경로 ──────────────────────────
+// CF Worker가 Discord에 즉시 type 5 응답을 보낸 뒤, 이 엔드포인트를 호출해
+// 실제 커맨드 처리 및 editReply 를 수행합니다.
+app.post('/bg-interaction', express.json(), async (req, res) => {
+  // 시크릿 검증 (WORKER_SECRET 설정 시)
+  if (WORKER_SECRET) {
+    const provided = req.headers['x-worker-secret'] || '';
+    if (provided !== WORKER_SECRET) {
+      console.warn('[BG] 잘못된 Worker Secret');
+      return res.status(403).json({ ok: false });
+    }
+  }
+  // 즉시 202로 응답 (CF Worker 대기 해제) — 실제 처리는 백그라운드
+  res.status(202).json({ ok: true });
+  const interaction = req.body;
+  processInteraction(interaction).catch(err => {
+    console.error('[BG] processInteraction error:', err.message, err.stack);
+  });
 });
 
 app.set('trust proxy', true);

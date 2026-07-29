@@ -24,6 +24,8 @@ services:
         generateValue: true
       - key: OAUTH_PROXY_URL
         value: https://discord-oauth-proxy.haydensunam524.workers.dev
+      - key: WORKER_SECRET
+        sync: false
 
   - type: cron
     name: keep-alive
